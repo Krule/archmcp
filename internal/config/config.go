@@ -41,7 +41,7 @@ func Default() *Config {
 			".archmcp/**",
 		},
 		Extractors: []string{"go", "kotlin", "openapi", "python", "rust", "typescript", "swift", "ruby"},
-		Explainers: []string{"cycles", "layers"},
+		Explainers: []string{"apisurface", "cohesion", "coupling", "coverage", "cycles", "deadcode", "depdepth", "godmodule", "layers", "stability", "testmap"},
 		Renderers:  []string{"llm_context"},
 		Output: OutputConfig{
 			Dir:              ".archmcp",

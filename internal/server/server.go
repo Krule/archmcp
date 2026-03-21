@@ -11,6 +11,16 @@ import (
 
 	"github.com/dejo1307/archmcp/internal/config"
 	"github.com/dejo1307/archmcp/internal/engine"
+	"github.com/dejo1307/archmcp/internal/explainers"
+	"github.com/dejo1307/archmcp/internal/explainers/apisurface"
+	"github.com/dejo1307/archmcp/internal/explainers/cohesion"
+	"github.com/dejo1307/archmcp/internal/explainers/coupling"
+	"github.com/dejo1307/archmcp/internal/explainers/coverage"
+	"github.com/dejo1307/archmcp/internal/explainers/deadcode"
+	"github.com/dejo1307/archmcp/internal/explainers/depdepth"
+	"github.com/dejo1307/archmcp/internal/explainers/godmodule"
+	"github.com/dejo1307/archmcp/internal/explainers/stability"
+	"github.com/dejo1307/archmcp/internal/explainers/testmap"
 	"github.com/dejo1307/archmcp/internal/facts"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -591,6 +601,80 @@ func (s *Server) registerTools() {
 				&mcp.TextContent{Text: string(data)},
 			},
 		}, nil, nil
+	})
+
+	// --- On-demand explainer tools ---
+
+	// Tool: analyze_coupling
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "analyze_coupling",
+		Description: "Analyze module-to-module coupling. Flags highly coupled pairs, hub modules with high fan-out, and reports the overall coupling ratio. Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, coupling.New(), args.Module)
+	})
+
+	// Tool: check_stability
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "check_stability",
+		Description: "Compute Robert Martin's stability metrics (Instability, Abstractness, Distance from Main Sequence) for all modules. Flags modules in the Zone of Pain or Zone of Uselessness. Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, stability.New(), args.Module)
+	})
+
+	// Tool: detect_god_modules
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "detect_god_modules",
+		Description: "Detect god modules — modules that have grown too large (>30 symbols) or too interconnected (fan-in+fan-out>15). Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, godmodule.New(), args.Module)
+	})
+
+	// Tool: check_dep_depth
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "check_dep_depth",
+		Description: "Measure dependency chain depth using topological sort. Reports the deepest dependency chain, average depth, and flags modules with depth exceeding 5. Handles cycles via Tarjan's SCC. Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, depdepth.New(), args.Module)
+	})
+
+	// Tool: analyze_api_surface
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "analyze_api_surface",
+		Description: "Analyze API surface efficiency. Finds exported symbols with zero external consumers (over-exposed), classifies symbols as over-exposed/narrow/healthy, and reports per-module API efficiency. Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, apisurface.New(), args.Module)
+	})
+
+	// Tool: analyze_cohesion
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "analyze_cohesion",
+		Description: "Measure intra-module cohesion using call-graph connectivity (LCOM variant). Detects disconnected components within modules that suggest mixed responsibilities. Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, cohesion.New(), args.Module)
+	})
+
+	// Tool: find_dead_code
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "find_dead_code",
+		Description: "Find potentially dead code — unexported symbols with zero incoming calls or imports. Excludes main/init, test functions, and interface implementations. Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, deadcode.New(), args.Module)
+	})
+
+	// Tool: check_trait_coverage
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "check_trait_coverage",
+		Description: "Analyze interface/trait implementation coverage. Detects orphan traits with zero implementors, computes implementation density, and reports coverage summary. Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, coverage.New(), args.Module)
+	})
+
+	// Tool: map_tests
+	mcp.AddTool(s.mcp, &mcp.Tool{
+		Name:        "map_tests",
+		Description: "Map test files to modules they test. Reports module-level test coverage, identifies untested modules, and highlights well-tested modules with high test density. Run generate_snapshot first.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args explainerToolArgs) (*mcp.CallToolResult, any, error) {
+		return s.runExplainerTool(ctx, testmap.New(), args.Module)
 	})
 }
 
@@ -1224,6 +1308,118 @@ func (s *Server) expandFilePrefix(prefix string) []string {
 		return []string{prefix}
 	}
 	return expanded
+}
+
+// explainerToolArgs are the arguments shared by all explainer tools.
+type explainerToolArgs struct {
+	Module string `json:"module,omitempty" jsonschema:"Optional module name to filter results. Only insights with evidence referencing this module are returned."`
+}
+
+// runExplainerTool runs an explainer on-demand, formats insights as markdown,
+// and optionally filters by module. Shared helper to reduce boilerplate across
+// the 9 explainer tool registrations.
+func (s *Server) runExplainerTool(ctx context.Context, exp explainers.Explainer, moduleFilter string) (*mcp.CallToolResult, any, error) {
+	store := s.eng.Store()
+	if store.Count() == 0 {
+		return errorResult("No facts available. Run generate_snapshot first."), nil, nil
+	}
+
+	insights, err := exp.Explain(ctx, store)
+	if err != nil {
+		return errorResult(fmt.Sprintf("analysis failed: %v", err)), nil, nil
+	}
+
+	if len(insights) == 0 {
+		return &mcp.CallToolResult{
+			Content: []mcp.Content{
+				&mcp.TextContent{Text: fmt.Sprintf("No issues found by %s analysis.", exp.Name())},
+			},
+		}, nil, nil
+	}
+
+	// Filter by module if requested.
+	if moduleFilter != "" {
+		var filtered []facts.Insight
+		for _, ins := range insights {
+			if insightMatchesModule(ins, moduleFilter) {
+				filtered = append(filtered, ins)
+			}
+		}
+		if len(filtered) == 0 {
+			return &mcp.CallToolResult{
+				Content: []mcp.Content{
+					&mcp.TextContent{Text: fmt.Sprintf("No %s issues found for module %q.", exp.Name(), moduleFilter)},
+				},
+			}, nil, nil
+		}
+		insights = filtered
+	}
+
+	md := formatInsightsMarkdown(exp.Name(), insights)
+	return &mcp.CallToolResult{
+		Content: []mcp.Content{
+			&mcp.TextContent{Text: md},
+		},
+	}, nil, nil
+}
+
+// insightMatchesModule returns true if any evidence in the insight references the given module.
+func insightMatchesModule(ins facts.Insight, module string) bool {
+	for _, ev := range ins.Evidence {
+		if strings.Contains(ev.Fact, module) || strings.Contains(ev.File, module) ||
+			strings.Contains(ev.Symbol, module) || strings.Contains(ev.Detail, module) {
+			return true
+		}
+	}
+	// Also check the title/description for module name.
+	return strings.Contains(ins.Title, module) || strings.Contains(ins.Description, module)
+}
+
+// formatInsightsMarkdown renders a list of insights as a markdown document.
+func formatInsightsMarkdown(analyzerName string, insights []facts.Insight) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("# %s Analysis\n\n", capitalize(analyzerName)))
+	sb.WriteString(fmt.Sprintf("Found %d insight(s).\n\n", len(insights)))
+
+	for i, ins := range insights {
+		sb.WriteString(fmt.Sprintf("## %d. %s\n\n", i+1, ins.Title))
+		sb.WriteString(ins.Description)
+		sb.WriteString("\n\n")
+
+		if ins.Confidence > 0 {
+			sb.WriteString(fmt.Sprintf("**Confidence:** %.0f%%\n\n", ins.Confidence*100))
+		}
+
+		if len(ins.Evidence) > 0 {
+			sb.WriteString("**Evidence:**\n\n")
+			for _, ev := range ins.Evidence {
+				sb.WriteString("- ")
+				if ev.Fact != "" {
+					sb.WriteString(fmt.Sprintf("`%s`", ev.Fact))
+				} else if ev.Symbol != "" {
+					sb.WriteString(fmt.Sprintf("`%s`", ev.Symbol))
+				}
+				if ev.File != "" {
+					sb.WriteString(fmt.Sprintf(" (%s)", ev.File))
+				}
+				if ev.Detail != "" {
+					sb.WriteString(fmt.Sprintf(" — %s", ev.Detail))
+				}
+				sb.WriteString("\n")
+			}
+			sb.WriteString("\n")
+		}
+
+		if len(ins.Actions) > 0 {
+			sb.WriteString("**Suggested actions:**\n\n")
+			for _, a := range ins.Actions {
+				sb.WriteString(fmt.Sprintf("- %s\n", a))
+			}
+			sb.WriteString("\n")
+		}
+	}
+
+	return sb.String()
 }
 
 func errorResult(msg string) *mcp.CallToolResult {

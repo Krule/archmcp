@@ -10,8 +10,17 @@ import (
 
 	"github.com/dejo1307/archmcp/internal/config"
 	"github.com/dejo1307/archmcp/internal/engine"
+	"github.com/dejo1307/archmcp/internal/explainers/apisurface"
+	"github.com/dejo1307/archmcp/internal/explainers/cohesion"
+	"github.com/dejo1307/archmcp/internal/explainers/coupling"
+	"github.com/dejo1307/archmcp/internal/explainers/coverage"
 	"github.com/dejo1307/archmcp/internal/explainers/cycles"
+	"github.com/dejo1307/archmcp/internal/explainers/deadcode"
+	"github.com/dejo1307/archmcp/internal/explainers/depdepth"
+	"github.com/dejo1307/archmcp/internal/explainers/godmodule"
 	"github.com/dejo1307/archmcp/internal/explainers/layers"
+	"github.com/dejo1307/archmcp/internal/explainers/stability"
+	"github.com/dejo1307/archmcp/internal/explainers/testmap"
 	"github.com/dejo1307/archmcp/internal/extractors/goextractor"
 	"github.com/dejo1307/archmcp/internal/extractors/kotlinextractor"
 	"github.com/dejo1307/archmcp/internal/extractors/openapiextractor"
@@ -100,8 +109,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 	eng.RegisterExtractor(rustextractor.New())
 
 	// Register explainers
+	eng.RegisterExplainer(apisurface.New())
+	eng.RegisterExplainer(cohesion.New())
+	eng.RegisterExplainer(coupling.New())
+	eng.RegisterExplainer(coverage.New())
 	eng.RegisterExplainer(cycles.New())
+	eng.RegisterExplainer(deadcode.New())
+	eng.RegisterExplainer(depdepth.New())
+	eng.RegisterExplainer(godmodule.New())
 	eng.RegisterExplainer(layers.New())
+	eng.RegisterExplainer(stability.New())
+	eng.RegisterExplainer(testmap.New())
 
 	// Register renderers
 	eng.RegisterRenderer(llmcontext.New(cfg.Output.MaxContextTokens))
