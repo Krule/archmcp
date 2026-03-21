@@ -7,6 +7,7 @@
 # Supported extractors:
 #   - go         (detection: go.mod)
 #   - kotlin     (detection: build.gradle.kts or build.gradle with Kotlin/Android)
+#   - rust       (detection: Cargo.toml)
 #   - typescript (detection: tsconfig.json or package.json with TypeScript)
 #   - swift      (detection: Package.swift, .xcodeproj, or .xcworkspace)
 #   - ruby       (detection: Gemfile)
@@ -49,6 +50,10 @@ ignore:
   - "**/*Tests.swift"
   - "**/*Test.swift"
 
+  # Rust / Cargo build output
+  - "target/**"
+  - "**/target/**"
+
   # Ruby / Rails
   - "**/*_spec.rb"
   - "**/*_test.rb"
@@ -85,6 +90,7 @@ ignore:
 extractors:
   - go
   - kotlin
+  - rust
   - typescript
   - swift
   - ruby

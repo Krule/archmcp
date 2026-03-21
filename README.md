@@ -10,7 +10,7 @@ archmcp is a local [Model Context Protocol (MCP)](https://modelcontextprotocol.i
 
 **Input for AI agents.** The snapshot output (modules, symbols, dependencies, architectural patterns) is structured context designed for LLM consumption. It is not a dashboard, not a visualization tool, not a documentation generator. It answers the question: *"What does this codebase look like?"* so the agent can skip the guessing phase.
 
-**Built for multi-repo work.** When you work across multiple repositories - a Go backend, a TypeScript frontend, a Python FastAPI service, a Kotlin Android app, a Swift iOS app, a Ruby on Rails API - having an architectural snapshot of each repo lets AI agents understand cross-repo structure without manually exploring every codebase from scratch. Use `append` mode to build a combined snapshot across multiple repos and query them together.
+**Built for multi-repo work.** When you work across multiple repositories - a Go backend, a TypeScript frontend, a Python FastAPI service, a Kotlin Android app, a Swift iOS app, a Ruby on Rails API, a Rust service - having an architectural snapshot of each repo lets AI agents understand cross-repo structure without manually exploring every codebase from scratch. Use `append` mode to build a combined snapshot across multiple repos and query them together.
 
 ## How It Works
 
@@ -19,7 +19,7 @@ archmcp runs as a stdio-based MCP server. When connected to an LLM client, it ex
 The pipeline:
 
 ```
-Repository -> File Walker -> Extractors (Go, Kotlin, Python, TypeScript, Swift, Ruby, OpenAPI) -> Fact Store
+Repository -> File Walker -> Extractors (Go, Kotlin, Python, TypeScript, Swift, Ruby, Rust, OpenAPI) -> Fact Store
   -> Graph Index -> Explainers (cycles, layers) -> Insights
   -> Renderers (LLM context) -> Artifacts
   -> MCP Server (resources + tools)
@@ -142,6 +142,7 @@ Once the snapshot exists, you do not need to reference archmcp explicitly. The L
 | TypeScript | tree-sitter   | `tsconfig.json`, `tsconfig.base.json`, or `package.json` with TypeScript (root or one level deep for monorepos) |
 | Swift      | regex scanner | `Package.swift`, `.xcodeproj`, or `.xcworkspace` present |
 | Ruby       | regex scanner | `Gemfile` present  |
+| Rust       | regex scanner | `Cargo.toml` present |
 | OpenAPI    | YAML/JSON scanner | any `.yml`, `.yaml`, or `.json` file containing `openapi:` or `swagger:` |
 
 Next.js route detection (App Router and Pages Router) is included in the TypeScript extractor. Additional TypeScript-specific capabilities:
@@ -165,6 +166,8 @@ The Swift extractor includes iOS-specific awareness: it detects SwiftUI views (`
 The OpenAPI extractor runs its own file system scan independently of the main walker, so it finds spec files even when `*.yml`/`*.yaml`/`*.json` are listed in the global `ignore` patterns. It detects candidates by name convention (files named or located under a directory named `openapi`/`swagger`) and confirms them by checking for an `openapi:` or `swagger:` key in the first 512 bytes. One `route` fact is emitted per operation, enriched with `method`, `operationId`, `summary`, `tags`, and a `spec_file` back-reference. Specs located inside an `openapi/client/` directory are marked `role: "client"` (routes this service calls on another service) while all others default to `role: "server"`. Custom `x-gateway-config.at-gateway-prefix` info-block extensions are parsed into `gateway_prefix` and `gateway_path` props; `x-gateway-capabilities` operation extensions are parsed into `exposed` and `auth_mode` props.
 
 The Ruby extractor includes Rails-specific awareness: it detects ActiveRecord models (associations like `has_many`, `belongs_to`, `has_one`, `has_and_belongs_to_many`; scopes; table name inference), Rails route DSL parsing (`config/routes.rb` - resources, namespaces, scopes, member/collection blocks), and Packwerk package boundary detection (`packwerk.yml`, `package.yml` with dependency enforcement). It also extracts modules, classes, methods with visibility tracking (`private`, `protected`, `public`), mixins (`include`, `extend`, `prepend`), `ActiveSupport::Concern` modules, constants, and attributes (`attr_reader`, `attr_writer`, `attr_accessor`).
+
+The Rust extractor parses symbols (`fn`, `struct`, `enum`, `trait`, `union`, `const`, `static`, `type` aliases, `macro_rules!`), `impl` blocks (both inherent and trait implementations with `RelImplements` edges), `use` statements (distinguishing `crate::`/`self::`/`super::` internal imports from external crate imports), `mod` declarations, `#[derive(...)]` trait implementations, visibility modifiers (`pub`, `pub(crate)`, `pub(super)`), `async`/`unsafe` function qualifiers, and `#[cfg(test)]` block skipping. Cargo workspace detection reads `[workspace]` from `Cargo.toml`.
 
 ## Configuration
 
@@ -238,6 +241,7 @@ extractors:
   - typescript
   - swift
   - ruby
+  - rust
 explainers:
   - cycles
   - layers
@@ -254,7 +258,7 @@ output:
 |-------|-------------|---------|
 | `repo` | Repository root path | `"."` |
 | `ignore` | Glob patterns for files/dirs to skip | vendor, node_modules, .git, tests, Next.js dirs, docs (.md, .mdx), config (yml, yaml, json), CI (e.g. Jenkinsfile), Dockerfile, .env* |
-| `extractors` | Enabled extractors | `["go", "kotlin", "openapi", "python", "typescript", "swift", "ruby"]` |
+| `extractors` | Enabled extractors | `["go", "kotlin", "openapi", "python", "typescript", "swift", "ruby", "rust"]` |
 | `explainers` | Enabled explainers | `["cycles", "layers"]` |
 | `renderers` | Enabled renderers | `["llm_context"]` |
 | `output.dir` | Output directory for artifacts | `".archmcp"` |
@@ -410,7 +414,7 @@ After facts are extracted, archmcp builds a bidirectional adjacency-list graph f
 
 Three plugin interfaces drive the pipeline:
 
-- **Extractors** - parse source code and emit facts (e.g., Go AST, Kotlin regex scanner, Python regex scanner, Swift regex scanner, Ruby regex scanner, TypeScript tree-sitter)
+- **Extractors** - parse source code and emit facts (e.g., Go AST, Kotlin regex scanner, Python regex scanner, Swift regex scanner, Ruby regex scanner, Rust regex scanner, TypeScript tree-sitter)
 - **Explainers** - analyze facts and produce insights (e.g., cycle detection, layer analysis)
 - **Renderers** - generate output artifacts from the snapshot (e.g., LLM context markdown)
 
@@ -442,11 +446,13 @@ archmcp/
 │   │   ├── tsextractor/ts.go        # TypeScript tree-sitter extractor (Next.js, monorepo-aware)
 │   │   ├── tsextractor/openapi.go   # openapi-typescript generated file parser
 │   │   ├── openapiextractor/openapi.go # OpenAPI 3.x/Swagger spec extractor (YAML/JSON)
-│   │   └── rubyextractor/
-│   │       ├── ruby.go              # Ruby regex extractor (Rails-aware)
-│   │       ├── routes.go            # Rails route DSL parser
-│   │       ├── packwerk.go          # Packwerk package boundary detector
-│   │       └── storage.go           # ActiveRecord model/storage extractor
+│   │   ├── rubyextractor/
+│   │   │   ├── ruby.go              # Ruby regex extractor (Rails-aware)
+│   │   │   ├── routes.go            # Rails route DSL parser
+│   │   │   ├── packwerk.go          # Packwerk package boundary detector
+│   │   │   └── storage.go           # ActiveRecord model/storage extractor
+│   │   └── rustextractor/
+│   │       └── rust.go              # Rust regex extractor (Cargo workspace-aware)
 │   ├── explainers/
 │   │   ├── registry.go              # Explainer interface + registry
 │   │   ├── cycles/cycles.go         # Cyclic dependency detector
@@ -462,6 +468,7 @@ archmcp/
 │   ├── typescript.yaml
 │   ├── swift.yaml
 │   ├── ruby.yaml
+│   ├── rust.yaml
 │   ├── multi-repo.yaml
 │   └── full.yaml
 ├── mcp-arch.yaml                    # Default config

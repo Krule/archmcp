@@ -1,0 +1,42 @@
+# archmcp configuration for a Rust project.
+#
+# Detection: The Rust extractor activates when Cargo.toml is present.
+# Features:  Functions (pub/async/unsafe), structs, enums, unions, traits,
+#            impl blocks (impl Type, impl Trait for Type), use statements
+#            (crate::/self::/super:: internal vs external), const/static,
+#            type aliases, macro_rules!, #[derive(...)] trait impls,
+#            #[cfg(test)] block skipping, Cargo workspace detection.
+
+repo: "."
+ignore:
+  # Dependencies and tooling
+  - ".git/**"
+  - ".archmcp/**"
+  # Rust / Cargo build output
+  - "target/**"
+  - "**/target/**"
+  # Documentation
+  - "**/*.md"
+  - "**/*.mdx"
+  # Config / data
+  - "**/*.yml"
+  - "**/*.yaml"
+  - "**/*.json"
+  # CI / ops
+  - "Jenkinsfile"
+  - "**/Jenkinsfile"
+  - "**/Jenkinsfile*"
+  # Docker and env files
+  - "Dockerfile"
+  - "**/Dockerfile*"
+  - "**/.env*"
+extractors:
+  - rust
+explainers:
+  - cycles
+  - layers
+renderers:
+  - llm_context
+output:
+  dir: ".archmcp"
+  max_context_tokens: 16000
