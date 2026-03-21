@@ -1,18 +1,23 @@
 package rustextractor
 
 import (
-	"bufio"
 	"context"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"unsafe"
 
+	"github.com/dejo1307/archmcp/internal/extractors/treesitter"
 	"github.com/dejo1307/archmcp/internal/facts"
+
+	sitter "github.com/tree-sitter/go-tree-sitter"
+	rust "github.com/tree-sitter/tree-sitter-rust/bindings/go"
 )
 
-// RustExtractor extracts architectural facts from Rust source code using line-based regex parsing.
+// RustExtractor extracts architectural facts from Rust source code using tree-sitter AST.
 type RustExtractor struct{}
 
 // New creates a new RustExtractor.
@@ -54,14 +59,13 @@ func (e *RustExtractor) Extract(ctx context.Context, repoPath string, files []st
 		}
 
 		absFile := filepath.Join(repoPath, relFile)
-		f, err := os.Open(absFile)
+		src, err := os.ReadFile(absFile)
 		if err != nil {
 			log.Printf("[rust-extractor] error reading %s: %v", relFile, err)
 			continue
 		}
 
-		fileFacts := extractFile(f, relFile)
-		f.Close()
+		fileFacts := extractFileAST(src, relFile)
 		allFacts = append(allFacts, fileFacts...)
 
 		dir := filepath.Dir(relFile)
@@ -88,641 +92,874 @@ func (e *RustExtractor) Extract(ctx context.Context, repoPath string, files []st
 	return allFacts, nil
 }
 
-// --- Regex patterns ---
+// extractFileAST parses a single Rust file using tree-sitter and returns facts.
+func extractFileAST(src []byte, relFile string) []facts.Fact {
+	lang := sitter.NewLanguage(unsafe.Pointer(rust.Language()))
+	tree, err := treesitter.Parse(src, lang)
+	if err != nil {
+		log.Printf("[rust-extractor] parse error for %s: %v", relFile, err)
+		return nil
+	}
+	defer tree.Close()
 
-var (
-	// use <path>;  or  use <path>::{...};  or  use <path> as ...;
-	useRe = regexp.MustCompile(`^\s*(?:pub\s+)?use\s+([a-zA-Z_][\w:*]+)`)
-
-	// fn declarations with optional pub/pub(crate)/async/unsafe/const/extern modifiers
-	fnRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)((?:(?:async|unsafe|const|extern\s*"[^"]*")\s+)*)fn\s+(\w+)`)
-
-	// struct declarations
-	structRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)struct\s+(\w+)`)
-
-	// enum declarations
-	enumRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)enum\s+(\w+)`)
-
-	// union declarations
-	unionRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)union\s+(\w+)`)
-
-	// trait declarations
-	traitRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)((?:unsafe\s+)?)trait\s+(\w+)`)
-
-	// impl [Trait for] Type
-	implTraitForRe = regexp.MustCompile(
-		`^\s*impl(?:\s*<[^>]*>)?\s+(\w+)\s+for\s+(\w+)`)
-	implRe = regexp.MustCompile(
-		`^\s*impl(?:\s*<[^>]*>)?\s+(\w+)`)
-
-	// const NAME: TYPE = ...;
-	constRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)const\s+(\w+)\s*:`)
-
-	// static [mut] NAME: TYPE = ...;
-	staticRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)static\s+(?:mut\s+)?(\w+)\s*:`)
-
-	// type Alias = ...;
-	typeAliasRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)type\s+(\w+)(?:\s*<[^>]*>)?\s*=`)
-
-	// macro_rules! name
-	macroRulesRe = regexp.MustCompile(
-		`^\s*(?:#\[macro_export\]\s*)?macro_rules!\s+(\w+)`)
-
-	// mod declarations: mod foo; or mod foo { ... }
-	// Captures: (1) optional pub/pub(crate)/pub(super) prefix, (2) module name
-	modDeclRe = regexp.MustCompile(
-		`^\s*((?:pub(?:\([^)]*\))?\s+)?)mod\s+(\w+)\s*([;{])`)
-
-	// #[derive(Trait1, Trait2, ...)]
-	deriveRe = regexp.MustCompile(`#\[derive\(([^)]+)\)\]`)
-
-	// #[cfg(test)]
-	cfgTestRe = regexp.MustCompile(`#\[cfg\(test\)\]`)
-
-	// General attribute: #[name] or #[name(...)] or #[path::name] or #[path::name(...)]
-	// Excludes derive (handled separately) and cfg (handled separately).
-	// Captures the full content between #[ and ]
-	attrRe = regexp.MustCompile(`#\[([^\]]+)\]`)
-
-	// Function/method call: optional qualifier (Type::, self., obj.) + name + "("
-	// group 1: qualifier, group 2: function name, group 3: "!" if macro
-	callRe = regexp.MustCompile(`(?:(\w+)(?:::|\.))?([\w]+)(!?)\s*\(`)
-)
-
-// extractFile parses a single Rust file and returns facts.
-func extractFile(f *os.File, relFile string) []facts.Fact {
-	var result []facts.Fact
+	root := tree.RootNode()
 	dir := filepath.Dir(relFile)
 
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
+	var result []facts.Fact
+	var pendingAttrs []attrInfo // attributes waiting to be applied to next item
 
-	type implCtx struct {
-		typeName  string // the type being impl'd
-		traitName string // non-empty if "impl Trait for Type"
-		depth     int    // braceDepth when the impl block opened
-	}
+	treesitter.WalkTopLevel(root, func(node *sitter.Node) {
+		kind := node.Kind()
 
-	type fnCtx struct {
-		factIdx int // index into result slice for the function/method fact
-		depth   int // braceDepth when the fn was declared (body is at depth+1)
-	}
-
-	var (
-		lineNum        int
-		braceDepth     int
-		pendingDerives []string // derives waiting to be applied to next struct/enum
-		pendingAttrs   []string // attribute macros waiting to be applied to next item
-		cfgTestDepth   int      // -1 = not in cfg(test), otherwise the braceDepth when we entered
-		cfgTestPending bool     // next item is #[cfg(test)]
-		inBlockComment bool
-		currentImpl    *implCtx // non-nil when inside an impl block
-		currentFn      *fnCtx   // non-nil when inside a function/method body
-	)
-	cfgTestDepth = -1
-
-	for scanner.Scan() {
-		lineNum++
-		line := scanner.Text()
-		trimmed := strings.TrimSpace(line)
-
-		// Skip block comments
-		if inBlockComment {
-			if strings.Contains(line, "*/") {
-				inBlockComment = false
+		// Collect attribute items (they appear as siblings before the item they decorate)
+		if kind == "attribute_item" {
+			ai := parseAttributeItem(node, src)
+			if ai.isCfgTest {
+				// Mark next item for cfg(test) skip — we clear pendingAttrs and skip the next item
+				pendingAttrs = append(pendingAttrs, ai)
+				return
 			}
-			continue
-		}
-		if strings.HasPrefix(trimmed, "/*") {
-			if !strings.Contains(line, "*/") {
-				inBlockComment = true
-			}
-			continue
+			pendingAttrs = append(pendingAttrs, ai)
+			return
 		}
 
-		// Skip line comments
-		if strings.HasPrefix(trimmed, "//") {
-			continue
-		}
-
-		// Check for #[cfg(test)] attribute
-		if cfgTestRe.MatchString(line) {
-			cfgTestPending = true
-			continue
-		}
-
-		// Track brace depth
-		openBraces := strings.Count(line, "{")
-		closeBraces := strings.Count(line, "}")
-
-		// If cfgTestPending and we see a brace opening, enter cfg(test) skip mode
-		if cfgTestPending && openBraces > 0 {
-			cfgTestDepth = braceDepth
-			braceDepth += openBraces - closeBraces
-			cfgTestPending = false
-			continue
-		}
-		cfgTestPending = false
-
-		// Effective depth: braceDepth BEFORE processing this line's braces
-		effectiveDepth := braceDepth
-
-		braceDepth += openBraces - closeBraces
-
-		// If we're in a cfg(test) block, skip until we exit
-		if cfgTestDepth >= 0 {
-			if braceDepth <= cfgTestDepth {
-				cfgTestDepth = -1
-			}
-			continue
-		}
-
-		// Clear impl context when we exit its brace scope
-		if currentImpl != nil && braceDepth <= currentImpl.depth {
-			currentImpl = nil
-		}
-
-		// Clear fn context when we exit its brace scope
-		if currentFn != nil && braceDepth <= currentFn.depth {
-			currentFn = nil
-		}
-
-		// Extract calls from function/method bodies
-		if currentFn != nil && effectiveDepth > currentFn.depth {
-			calls := extractCalls(line)
-			for _, call := range calls {
-				result[currentFn.factIdx].Relations = append(
-					result[currentFn.factIdx].Relations,
-					facts.Relation{Kind: facts.RelCalls, Target: call},
-				)
-			}
-		}
-
-		// Inside an impl block at depth 1: extract methods
-		if currentImpl != nil && effectiveDepth == currentImpl.depth+1 {
-			if m := fnRe.FindStringSubmatch(line); m != nil {
-				pubMod := m[1]
-				modifiers := m[2]
-				name := m[3]
-				exported := strings.Contains(pubMod, "pub")
-
-				ff := facts.Fact{
-					Kind: facts.KindSymbol,
-					Name: dir + "." + currentImpl.typeName + "." + name,
-					File: relFile,
-					Line: lineNum,
-					Props: map[string]any{
-						"symbol_kind": facts.SymbolMethod,
-						"exported":    exported,
-						"language":    "rust",
-						"receiver":    currentImpl.typeName,
-					},
-					Relations: []facts.Relation{
-						{Kind: facts.RelDeclares, Target: dir},
-					},
-				}
-				if currentImpl.traitName != "" {
-					ff.Props["trait"] = currentImpl.traitName
-				}
-				if strings.Contains(modifiers, "async") {
-					ff.Props["async"] = true
-				}
-				if strings.Contains(modifiers, "unsafe") {
-					ff.Props["unsafe"] = true
-				}
-				result = append(result, ff)
-				// Track this method for call extraction
-				if openBraces > 0 {
-					currentFn = &fnCtx{factIdx: len(result) - 1, depth: effectiveDepth}
-				}
-				continue
-			}
-		}
-
-		// Only extract top-level items (effectiveDepth == 0) beyond this point
-		if effectiveDepth > 0 {
-			continue
-		}
-
-		// Collect #[derive(...)] attributes
-		if m := deriveRe.FindStringSubmatch(line); m != nil {
-			traits := parseDeriveLine(m[1])
-			pendingDerives = append(pendingDerives, traits...)
-			// If the line only has the derive attribute and nothing else, continue
-			if !structRe.MatchString(line) && !enumRe.MatchString(line) {
-				continue
-			}
-		}
-
-		// Collect general attribute macros (non-derive, non-cfg)
-		if attrs := extractAttributes(trimmed); len(attrs) > 0 {
-			pendingAttrs = append(pendingAttrs, attrs...)
-			// If the line is only attributes (no item declaration), continue
-			if !fnRe.MatchString(line) && !structRe.MatchString(line) &&
-				!enumRe.MatchString(line) && !unionRe.MatchString(line) &&
-				!constRe.MatchString(line) && !staticRe.MatchString(line) &&
-				!typeAliasRe.MatchString(line) && !traitRe.MatchString(line) {
-				continue
-			}
-		}
-
-		// macro_rules!
-		if m := macroRulesRe.FindStringSubmatch(line); m != nil {
-			name := m[1]
-			result = append(result, facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolFunc,
-					"exported":    false,
-					"language":    "rust",
-					"macro":       true,
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			})
-			pendingDerives = nil
+		// Check if previous attributes include cfg(test) — skip this item entirely
+		if hasCfgTest(pendingAttrs) {
 			pendingAttrs = nil
-			continue
+			return
 		}
 
-		// mod declarations: mod foo; or mod foo { ... }
-		if m := modDeclRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			name := m[2]
-			terminator := m[3] // ";" for external, "{" for inline
-			exported := strings.Contains(pubMod, "pub")
+		switch kind {
+		case "use_declaration":
+			result = append(result, extractUseDecl(node, src, relFile, dir)...)
 
-			modStyle := "external"
-			if terminator == "{" {
-				modStyle = "inline"
-			}
-
-			props := map[string]any{
-				"symbol_kind": "module",
-				"exported":    exported,
-				"language":    "rust",
-				"mod_style":   modStyle,
-			}
-
-			// Capture specific visibility for pub(crate), pub(super), etc.
-			trimmedPub := strings.TrimSpace(pubMod)
-			if strings.HasPrefix(trimmedPub, "pub(") {
-				props["visibility"] = trimmedPub
-			}
-
-			result = append(result, facts.Fact{
-				Kind:  facts.KindSymbol,
-				Name:  dir + "." + name,
-				File:  relFile,
-				Line:  lineNum,
-				Props: props,
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			})
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// use statements
-		if m := useRe.FindStringSubmatch(line); m != nil {
-			importPath := m[1]
-
-			// Determine if internal (crate::, self::, super::) or external
-			source := "external"
-			target := importPath
-			if strings.HasPrefix(importPath, "crate::") || strings.HasPrefix(importPath, "self::") || strings.HasPrefix(importPath, "super::") {
-				source = "internal"
-				// Keep the full path as target for internal imports
-			} else {
-				// For external imports, use just the crate name (first segment)
-				parts := strings.SplitN(importPath, "::", 2)
-				target = parts[0]
-			}
-
-			result = append(result, facts.Fact{
-				Kind: facts.KindDependency,
-				Name: dir + " -> " + target,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"language": "rust",
-					"source":   source,
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelImports, Target: target},
-				},
-			})
-			continue
-		}
-
-		// impl Trait for Type — set context and emit relation
-		if m := implTraitForRe.FindStringSubmatch(line); m != nil {
-			traitName := m[1]
-			typeName := m[2]
-			result = append(result, implRelation{
-				typeName:  typeName,
-				traitName: traitName,
-				dir:       dir,
-			}.asFact(relFile, lineNum))
-			if openBraces > 0 {
-				currentImpl = &implCtx{
-					typeName:  typeName,
-					traitName: traitName,
-					depth:     effectiveDepth,
-				}
-			}
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// impl Type — set context (must come after implTraitForRe check)
-		if m := implRe.FindStringSubmatch(line); m != nil {
-			typeName := m[1]
-			if openBraces > 0 {
-				currentImpl = &implCtx{
-					typeName:  typeName,
-					traitName: "",
-					depth:     effectiveDepth,
-				}
-			}
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// trait declarations
-		if m := traitRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			name := m[3]
-			exported := strings.Contains(pubMod, "pub")
-
-			f := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolInterface,
-					"exported":    exported,
-					"language":    "rust",
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			}
-			applyPendingAttrs(&f, pendingAttrs)
-			result = append(result, f)
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// struct declarations
-		if m := structRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			name := m[2]
-			exported := strings.Contains(pubMod, "pub")
-
-			f := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolStruct,
-					"exported":    exported,
-					"language":    "rust",
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			}
-			// Apply pending derives
-			for _, trait := range pendingDerives {
-				f.Relations = append(f.Relations, facts.Relation{
-					Kind:   facts.RelImplements,
-					Target: trait,
-				})
-			}
-			applyPendingAttrs(&f, pendingAttrs)
-			result = append(result, f)
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// enum declarations
-		if m := enumRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			name := m[2]
-			exported := strings.Contains(pubMod, "pub")
-
-			f := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolType,
-					"exported":    exported,
-					"language":    "rust",
-					"enum":        true,
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			}
-			for _, trait := range pendingDerives {
-				f.Relations = append(f.Relations, facts.Relation{
-					Kind:   facts.RelImplements,
-					Target: trait,
-				})
-			}
-			applyPendingAttrs(&f, pendingAttrs)
-			result = append(result, f)
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// union declarations
-		if m := unionRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			name := m[2]
-			exported := strings.Contains(pubMod, "pub")
-
-			f := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolStruct,
-					"exported":    exported,
-					"language":    "rust",
-					"union":       true,
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			}
-			for _, trait := range pendingDerives {
-				f.Relations = append(f.Relations, facts.Relation{
-					Kind:   facts.RelImplements,
-					Target: trait,
-				})
-			}
-			applyPendingAttrs(&f, pendingAttrs)
-			result = append(result, f)
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// fn declarations (top-level only)
-		if m := fnRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			modifiers := m[2]
-			name := m[3]
-			exported := strings.Contains(pubMod, "pub")
-
-			ff := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolFunc,
-					"exported":    exported,
-					"language":    "rust",
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			}
-			if strings.Contains(modifiers, "async") {
-				ff.Props["async"] = true
-			}
-			if strings.Contains(modifiers, "unsafe") {
-				ff.Props["unsafe"] = true
-			}
-			applyPendingAttrs(&ff, pendingAttrs)
+		case "function_item":
+			ff := extractFunctionItem(node, src, relFile, dir, false)
+			applyPendingAttrsToFact(&ff, pendingAttrs)
 			result = append(result, ff)
-			// Track this function for call extraction
-			if openBraces > 0 {
-				currentFn = &fnCtx{factIdx: len(result) - 1, depth: effectiveDepth}
+
+		case "struct_item":
+			ff := extractStructItem(node, src, relFile, dir)
+			applyDeriveRelations(&ff, pendingAttrs)
+			applyNonDeriveAttrs(&ff, pendingAttrs)
+			result = append(result, ff)
+
+		case "enum_item":
+			ff := extractEnumItem(node, src, relFile, dir)
+			applyDeriveRelations(&ff, pendingAttrs)
+			applyNonDeriveAttrs(&ff, pendingAttrs)
+			result = append(result, ff)
+
+		case "union_item":
+			ff := extractUnionItem(node, src, relFile, dir)
+			applyDeriveRelations(&ff, pendingAttrs)
+			applyNonDeriveAttrs(&ff, pendingAttrs)
+			result = append(result, ff)
+
+		case "trait_item":
+			ff := extractTraitItem(node, src, relFile, dir)
+			applyNonDeriveAttrs(&ff, pendingAttrs)
+			result = append(result, ff)
+
+		case "impl_item":
+			result = append(result, extractImplItem(node, src, relFile, dir)...)
+
+		case "const_item":
+			ff := extractConstItem(node, src, relFile, dir)
+			if ff != nil {
+				applyNonDeriveAttrs(ff, pendingAttrs)
+				result = append(result, *ff)
 			}
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
+
+		case "static_item":
+			ff := extractStaticItem(node, src, relFile, dir)
+			applyNonDeriveAttrs(&ff, pendingAttrs)
+			result = append(result, ff)
+
+		case "type_item":
+			ff := extractTypeItem(node, src, relFile, dir)
+			applyNonDeriveAttrs(&ff, pendingAttrs)
+			result = append(result, ff)
+
+		case "macro_definition":
+			ff := extractMacroDef(node, src, relFile, dir)
+			result = append(result, ff)
+
+		case "mod_item":
+			ff := extractModItem(node, src, relFile, dir)
+			result = append(result, ff)
 		}
 
-		// const declarations
-		if m := constRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			name := m[2]
-			if name == "_" {
-				pendingAttrs = nil
-				continue
-			}
-			exported := strings.Contains(pubMod, "pub")
-
-			f := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolConstant,
-					"exported":    exported,
-					"language":    "rust",
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			}
-			applyPendingAttrs(&f, pendingAttrs)
-			result = append(result, f)
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// static declarations
-		if m := staticRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			name := m[2]
-			exported := strings.Contains(pubMod, "pub")
-
-			f := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolVariable,
-					"exported":    exported,
-					"language":    "rust",
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			}
-			applyPendingAttrs(&f, pendingAttrs)
-			result = append(result, f)
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-
-		// type alias declarations
-		if m := typeAliasRe.FindStringSubmatch(line); m != nil {
-			pubMod := m[1]
-			name := m[2]
-			exported := strings.Contains(pubMod, "pub")
-
-			f := facts.Fact{
-				Kind: facts.KindSymbol,
-				Name: dir + "." + name,
-				File: relFile,
-				Line: lineNum,
-				Props: map[string]any{
-					"symbol_kind": facts.SymbolType,
-					"exported":    exported,
-					"language":    "rust",
-				},
-				Relations: []facts.Relation{
-					{Kind: facts.RelDeclares, Target: dir},
-				},
-			}
-			applyPendingAttrs(&f, pendingAttrs)
-			result = append(result, f)
-			pendingDerives = nil
-			pendingAttrs = nil
-			continue
-		}
-	}
+		pendingAttrs = nil
+	})
 
 	// Merge impl-trait-for relations onto existing struct/enum facts
 	result = mergeImplRelations(result)
 
 	return result
 }
+
+// --- Attribute handling ---
+
+type attrInfo struct {
+	isDeriveAttr bool
+	isCfgTest    bool
+	derives      []string // trait names from #[derive(X, Y)]
+	rawText      string   // full text of the attribute content (e.g. "serde(rename_all = \"camelCase\")")
+}
+
+func parseAttributeItem(node *sitter.Node, src []byte) attrInfo {
+	attr := treesitter.FindChildByKind(node, "attribute")
+	if attr == nil {
+		return attrInfo{}
+	}
+
+	attrText := treesitter.NodeText(attr, src)
+
+	// Check for #[cfg(test)]
+	nameNode := treesitter.FindChildByKind(attr, "identifier")
+	if nameNode != nil && treesitter.NodeText(nameNode, src) == "cfg" {
+		tokenTree := treesitter.FindChildByKind(attr, "token_tree")
+		if tokenTree != nil {
+			ttText := treesitter.NodeText(tokenTree, src)
+			if ttText == "(test)" {
+				return attrInfo{isCfgTest: true}
+			}
+		}
+	}
+
+	// Check for #[derive(...)]
+	if nameNode != nil && treesitter.NodeText(nameNode, src) == "derive" {
+		tokenTree := treesitter.FindChildByKind(attr, "token_tree")
+		if tokenTree != nil {
+			var derives []string
+			for i := range tokenTree.ChildCount() {
+				child := tokenTree.Child(i)
+				if child.Kind() == "identifier" {
+					derives = append(derives, treesitter.NodeText(child, src))
+				}
+			}
+			return attrInfo{isDeriveAttr: true, derives: derives}
+		}
+	}
+
+	// General attribute (non-derive, non-cfg)
+	return attrInfo{rawText: attrText}
+}
+
+func hasCfgTest(attrs []attrInfo) bool {
+	for _, a := range attrs {
+		if a.isCfgTest {
+			return true
+		}
+	}
+	return false
+}
+
+func applyDeriveRelations(f *facts.Fact, attrs []attrInfo) {
+	for _, a := range attrs {
+		if a.isDeriveAttr {
+			for _, trait := range a.derives {
+				f.Relations = append(f.Relations, facts.Relation{
+					Kind:   facts.RelImplements,
+					Target: trait,
+				})
+			}
+		}
+	}
+}
+
+func applyNonDeriveAttrs(f *facts.Fact, attrs []attrInfo) {
+	var nonDeriveAttrs []string
+	for _, a := range attrs {
+		if !a.isDeriveAttr && !a.isCfgTest && a.rawText != "" {
+			// Skip doc and macro_export attributes
+			if strings.HasPrefix(a.rawText, "doc") || a.rawText == "macro_export" {
+				continue
+			}
+			nonDeriveAttrs = append(nonDeriveAttrs, a.rawText)
+		}
+	}
+	if len(nonDeriveAttrs) > 0 {
+		f.Props["attributes"] = nonDeriveAttrs
+	}
+}
+
+func applyPendingAttrsToFact(f *facts.Fact, attrs []attrInfo) {
+	applyNonDeriveAttrs(f, attrs)
+}
+
+// --- Extraction helpers ---
+
+func hasVisibility(node *sitter.Node) bool {
+	return treesitter.FindChildByKind(node, "visibility_modifier") != nil
+}
+
+func visibilityText(node *sitter.Node, src []byte) string {
+	vis := treesitter.FindChildByKind(node, "visibility_modifier")
+	if vis == nil {
+		return ""
+	}
+	return treesitter.NodeText(vis, src)
+}
+
+func hasModifier(node *sitter.Node, src []byte, mod string) bool {
+	mods := treesitter.FindChildByKind(node, "function_modifiers")
+	if mods == nil {
+		return false
+	}
+	return strings.Contains(treesitter.NodeText(mods, src), mod)
+}
+
+func nodeName(node *sitter.Node, src []byte) string {
+	name := treesitter.FindChildByKind(node, "identifier")
+	if name != nil {
+		return treesitter.NodeText(name, src)
+	}
+	name = treesitter.FindChildByKind(node, "type_identifier")
+	if name != nil {
+		return treesitter.NodeText(name, src)
+	}
+	return ""
+}
+
+// --- use_declaration ---
+
+func extractUseDecl(node *sitter.Node, src []byte, relFile, dir string) []facts.Fact {
+	// Get the use path: can be scoped_identifier, identifier, use_list, etc.
+	// We extract the full path text (excluding "use" keyword and ";")
+	var importPath string
+	for i := range node.ChildCount() {
+		child := node.Child(i)
+		k := child.Kind()
+		if k == "use" || k == ";" || k == "visibility_modifier" {
+			continue
+		}
+		importPath = treesitter.NodeText(child, src)
+		break
+	}
+	if importPath == "" {
+		return nil
+	}
+
+	// Determine if internal (crate::, self::, super::) or external
+	source := "external"
+	target := importPath
+	if strings.HasPrefix(importPath, "crate::") || strings.HasPrefix(importPath, "self::") || strings.HasPrefix(importPath, "super::") {
+		source = "internal"
+	} else {
+		// For external imports, use just the crate name (first segment)
+		parts := strings.SplitN(importPath, "::", 2)
+		target = parts[0]
+	}
+
+	return []facts.Fact{{
+		Kind: facts.KindDependency,
+		Name: dir + " -> " + target,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"language": "rust",
+			"source":   source,
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelImports, Target: target},
+		},
+	}}
+}
+
+// --- function_item ---
+
+func extractFunctionItem(node *sitter.Node, src []byte, relFile, dir string, isMethod bool) facts.Fact {
+	name := nodeName(node, src)
+	exported := hasVisibility(node)
+	isAsync := hasModifier(node, src, "async")
+	isUnsafe := hasModifier(node, src, "unsafe")
+
+	symbolKind := facts.SymbolFunc
+	if isMethod {
+		symbolKind = facts.SymbolMethod
+	}
+
+	ff := facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + name,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": symbolKind,
+			"exported":    exported,
+			"language":    "rust",
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+	if isAsync {
+		ff.Props["async"] = true
+	}
+	if isUnsafe {
+		ff.Props["unsafe"] = true
+	}
+
+	// Extract calls from the function body
+	block := treesitter.FindChildByKind(node, "block")
+	if block != nil {
+		calls := extractCallsFromNode(block, src)
+		for _, call := range calls {
+			ff.Relations = append(ff.Relations, facts.Relation{
+				Kind:   facts.RelCalls,
+				Target: call,
+			})
+		}
+	}
+
+	return ff
+}
+
+// --- struct_item ---
+
+func extractStructItem(node *sitter.Node, src []byte, relFile, dir string) facts.Fact {
+	name := treesitter.FindChildByKind(node, "type_identifier")
+	nameStr := ""
+	if name != nil {
+		nameStr = treesitter.NodeText(name, src)
+	}
+	exported := hasVisibility(node)
+
+	return facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + nameStr,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolStruct,
+			"exported":    exported,
+			"language":    "rust",
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+}
+
+// --- enum_item ---
+
+func extractEnumItem(node *sitter.Node, src []byte, relFile, dir string) facts.Fact {
+	name := treesitter.FindChildByKind(node, "type_identifier")
+	nameStr := ""
+	if name != nil {
+		nameStr = treesitter.NodeText(name, src)
+	}
+	exported := hasVisibility(node)
+
+	return facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + nameStr,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolType,
+			"exported":    exported,
+			"language":    "rust",
+			"enum":        true,
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+}
+
+// --- union_item ---
+
+func extractUnionItem(node *sitter.Node, src []byte, relFile, dir string) facts.Fact {
+	name := treesitter.FindChildByKind(node, "type_identifier")
+	nameStr := ""
+	if name != nil {
+		nameStr = treesitter.NodeText(name, src)
+	}
+	exported := hasVisibility(node)
+
+	return facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + nameStr,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolStruct,
+			"exported":    exported,
+			"language":    "rust",
+			"union":       true,
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+}
+
+// --- trait_item ---
+
+func extractTraitItem(node *sitter.Node, src []byte, relFile, dir string) facts.Fact {
+	name := treesitter.FindChildByKind(node, "type_identifier")
+	nameStr := ""
+	if name != nil {
+		nameStr = treesitter.NodeText(name, src)
+	}
+	exported := hasVisibility(node)
+
+	return facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + nameStr,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolInterface,
+			"exported":    exported,
+			"language":    "rust",
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+}
+
+// --- impl_item ---
+
+func extractImplItem(node *sitter.Node, src []byte, relFile, dir string) []facts.Fact {
+	var result []facts.Fact
+
+	// Determine if this is "impl Type" or "impl Trait for Type"
+	// In the AST: impl_item has type_identifier children.
+	// For "impl Trait for Type": impl, type_identifier(Trait), for, type_identifier(Type), declaration_list
+	// For "impl Type": impl, type_identifier(Type), declaration_list
+	typeIdents := treesitter.FindChildrenByKind(node, "type_identifier")
+
+	var typeName, traitName string
+	hasFork := treesitter.FindChildByKind(node, "for") != nil
+
+	if hasFork && len(typeIdents) >= 2 {
+		// impl Trait for Type
+		traitName = treesitter.NodeText(typeIdents[0], src)
+		typeName = treesitter.NodeText(typeIdents[1], src)
+	} else if len(typeIdents) >= 1 {
+		// impl Type (possibly with generics)
+		// The type_identifier could be the first or only one
+		typeName = treesitter.NodeText(typeIdents[0], src)
+	}
+
+	// If it's "impl Trait for Type", emit impl relation
+	if traitName != "" {
+		result = append(result, implRelation{
+			typeName:  typeName,
+			traitName: traitName,
+			dir:       dir,
+		}.asFact(relFile, int(node.StartPosition().Row)+1))
+	}
+
+	// Extract methods from declaration_list
+	declList := treesitter.FindChildByKind(node, "declaration_list")
+	if declList == nil {
+		return result
+	}
+
+	for i := range declList.ChildCount() {
+		child := declList.Child(i)
+		if child.Kind() != "function_item" {
+			continue
+		}
+
+		methodName := nodeName(child, src)
+		exported := hasVisibility(child)
+		isAsync := hasModifier(child, src, "async")
+		isUnsafe := hasModifier(child, src, "unsafe")
+
+		ff := facts.Fact{
+			Kind: facts.KindSymbol,
+			Name: dir + "." + typeName + "." + methodName,
+			File: relFile,
+			Line: int(child.StartPosition().Row) + 1,
+			Props: map[string]any{
+				"symbol_kind": facts.SymbolMethod,
+				"exported":    exported,
+				"language":    "rust",
+				"receiver":    typeName,
+			},
+			Relations: []facts.Relation{
+				{Kind: facts.RelDeclares, Target: dir},
+			},
+		}
+		if traitName != "" {
+			ff.Props["trait"] = traitName
+		}
+		if isAsync {
+			ff.Props["async"] = true
+		}
+		if isUnsafe {
+			ff.Props["unsafe"] = true
+		}
+
+		// Extract calls from method body
+		block := treesitter.FindChildByKind(child, "block")
+		if block != nil {
+			calls := extractCallsFromNode(block, src)
+			for _, call := range calls {
+				ff.Relations = append(ff.Relations, facts.Relation{
+					Kind:   facts.RelCalls,
+					Target: call,
+				})
+			}
+		}
+
+		result = append(result, ff)
+	}
+
+	return result
+}
+
+// --- const_item ---
+
+func extractConstItem(node *sitter.Node, src []byte, relFile, dir string) *facts.Fact {
+	name := nodeName(node, src)
+	if name == "_" {
+		return nil
+	}
+	exported := hasVisibility(node)
+
+	f := facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + name,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolConstant,
+			"exported":    exported,
+			"language":    "rust",
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+	return &f
+}
+
+// --- static_item ---
+
+func extractStaticItem(node *sitter.Node, src []byte, relFile, dir string) facts.Fact {
+	name := nodeName(node, src)
+	exported := hasVisibility(node)
+
+	return facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + name,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolVariable,
+			"exported":    exported,
+			"language":    "rust",
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+}
+
+// --- type_item ---
+
+func extractTypeItem(node *sitter.Node, src []byte, relFile, dir string) facts.Fact {
+	name := treesitter.FindChildByKind(node, "type_identifier")
+	nameStr := ""
+	if name != nil {
+		nameStr = treesitter.NodeText(name, src)
+	}
+	exported := hasVisibility(node)
+
+	return facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + nameStr,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolType,
+			"exported":    exported,
+			"language":    "rust",
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+}
+
+// --- macro_definition ---
+
+func extractMacroDef(node *sitter.Node, src []byte, relFile, dir string) facts.Fact {
+	name := nodeName(node, src)
+
+	return facts.Fact{
+		Kind: facts.KindSymbol,
+		Name: dir + "." + name,
+		File: relFile,
+		Line: int(node.StartPosition().Row) + 1,
+		Props: map[string]any{
+			"symbol_kind": facts.SymbolFunc,
+			"exported":    false,
+			"language":    "rust",
+			"macro":       true,
+		},
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+}
+
+// --- mod_item ---
+
+func extractModItem(node *sitter.Node, src []byte, relFile, dir string) facts.Fact {
+	name := nodeName(node, src)
+	exported := hasVisibility(node)
+
+	// Determine mod style: external (has ";") vs inline (has declaration_list)
+	modStyle := "external"
+	if treesitter.FindChildByKind(node, "declaration_list") != nil {
+		modStyle = "inline"
+	}
+
+	props := map[string]any{
+		"symbol_kind": "module",
+		"exported":    exported,
+		"language":    "rust",
+		"mod_style":   modStyle,
+	}
+
+	// Capture specific visibility for pub(crate), pub(super), etc.
+	visText := visibilityText(node, src)
+	if strings.HasPrefix(visText, "pub(") {
+		props["visibility"] = visText
+	}
+
+	return facts.Fact{
+		Kind:  facts.KindSymbol,
+		Name:  dir + "." + name,
+		File:  relFile,
+		Line:  int(node.StartPosition().Row) + 1,
+		Props: props,
+		Relations: []facts.Relation{
+			{Kind: facts.RelDeclares, Target: dir},
+		},
+	}
+}
+
+// --- Call extraction from AST ---
+
+// Keywords that look like function calls but aren't.
+var callKeywords = map[string]bool{
+	"if": true, "while": true, "for": true, "match": true,
+	"return": true, "let": true, "else": true, "unsafe": true,
+	"async": true, "await": true, "move": true, "loop": true,
+	"fn": true, "pub": true, "use": true, "mod": true,
+	"struct": true, "enum": true, "trait": true, "impl": true,
+	"type": true, "const": true, "static": true, "where": true,
+	"as": true, "in": true, "ref": true, "mut": true,
+	"Some": true, "None": true, "Ok": true, "Err": true,
+	"Box": true, "Vec": true, "Arc": true, "Rc": true,
+}
+
+// extractCallsFromNode walks a block node and extracts call_expression targets.
+// Returns deduplicated call targets in dotted form matching the regex-based extractCalls output.
+func extractCallsFromNode(block *sitter.Node, src []byte) []string {
+	seen := make(map[string]bool)
+	var calls []string
+
+	walkDescendants(block, func(node *sitter.Node) {
+		if node.Kind() != "call_expression" {
+			return
+		}
+
+		target := extractCallTarget(node, src)
+		if target == "" {
+			return
+		}
+
+		if !seen[target] {
+			seen[target] = true
+			calls = append(calls, target)
+		}
+	})
+
+	return calls
+}
+
+// extractCallTarget extracts the call target string from a call_expression node.
+// Returns "" if the target should be skipped (keyword, etc.)
+func extractCallTarget(node *sitter.Node, src []byte) string {
+	if node.ChildCount() == 0 {
+		return ""
+	}
+
+	fn := node.Child(0) // The function being called
+	switch fn.Kind() {
+	case "identifier":
+		// Simple function call: callee()
+		name := treesitter.NodeText(fn, src)
+		if callKeywords[name] {
+			return ""
+		}
+		return name
+
+	case "field_expression":
+		// Method call: obj.method() or self.method()
+		// field_expression has: <expr> . <field_identifier>
+		obj := fn.Child(0)
+		field := treesitter.FindChildByKind(fn, "field_identifier")
+		if obj == nil || field == nil {
+			return ""
+		}
+		objName := ""
+		switch obj.Kind() {
+		case "identifier":
+			objName = treesitter.NodeText(obj, src)
+		case "self":
+			objName = "self"
+		default:
+			// Complex expression like foo.bar.baz() — use the source text of the receiver
+			objName = treesitter.NodeText(obj, src)
+		}
+		fieldName := treesitter.NodeText(field, src)
+		if callKeywords[objName] || callKeywords[fieldName] {
+			return ""
+		}
+		return objName + "." + fieldName
+
+	case "scoped_identifier":
+		// Qualified call: Type::method() or module::function()
+		// scoped_identifier has: <identifier|scoped_identifier> :: <identifier>
+		parts := flattenScopedIdent(fn, src)
+		if len(parts) == 0 {
+			return ""
+		}
+		// Use dotted form to match regex behavior: "Config::load" -> "Config.load"
+		target := strings.Join(parts, ".")
+		// Check if last part is a keyword
+		last := parts[len(parts)-1]
+		if callKeywords[last] {
+			return ""
+		}
+		return target
+	}
+
+	return ""
+}
+
+// flattenScopedIdent flattens a scoped_identifier tree into string parts.
+// e.g. std::io::stdout -> ["std", "io", "stdout"]
+// But for call targets we only want the last two segments to match regex behavior.
+func flattenScopedIdent(node *sitter.Node, src []byte) []string {
+	if node == nil {
+		return nil
+	}
+	switch node.Kind() {
+	case "identifier":
+		return []string{treesitter.NodeText(node, src)}
+	case "crate":
+		return []string{"crate"}
+	case "self":
+		return []string{"self"}
+	case "super":
+		return []string{"super"}
+	case "scoped_identifier":
+		var parts []string
+		for i := range node.ChildCount() {
+			child := node.Child(i)
+			if child.Kind() == "::" {
+				continue
+			}
+			parts = append(parts, flattenScopedIdent(child, src)...)
+		}
+		// For call targets, regex only captures the last two segments.
+		// e.g. "std::io::stdout()" regex matches as "io.stdout"
+		// But "Config::load()" matches as "Config.load"
+		// The regex pattern is: (?:(\w+)(?:::|\.))?([\w]+)(!?)\s*\(
+		// This means it only captures ONE qualifier and one name.
+		if len(parts) > 2 {
+			parts = parts[len(parts)-2:]
+		}
+		return parts
+	}
+	return []string{treesitter.NodeText(node, src)}
+}
+
+// walkDescendants visits all descendants of a node, calling fn for each.
+func walkDescendants(node *sitter.Node, fn func(*sitter.Node)) {
+	for i := range node.ChildCount() {
+		child := node.Child(i)
+		fn(child)
+		walkDescendants(child, fn)
+	}
+}
+
+// --- extractFile wrapper for backward compatibility with tests ---
+// The tests call extractFile(f *os.File, relFile string), so we keep this wrapper.
+
+func extractFile(f *os.File, relFile string) []facts.Fact {
+	src, err := io.ReadAll(f)
+	if err != nil {
+		log.Printf("[rust-extractor] error reading %s: %v", relFile, err)
+		return nil
+	}
+	return extractFileAST(src, relFile)
+}
+
+// --- Regex-based call extraction (preserved for direct unit test calls) ---
+
+var (
+	// Function/method call: optional qualifier (Type::, self., obj.) + name + "("
+	// group 1: qualifier, group 2: function name, group 3: "!" if macro
+	callRe = regexp.MustCompile(`(?:(\w+)(?:::|\.))?([\w]+)(!?)\s*\(`)
+)
+
+// extractCalls extracts function/method call targets from a single line of Rust code.
+// Returns slice of call targets in dotted form: "func", "qualifier.func".
+func extractCalls(line string) []string {
+	matches := callRe.FindAllStringSubmatch(line, -1)
+	var calls []string
+	seen := make(map[string]bool)
+
+	for _, m := range matches {
+		qualifier := m[1]
+		name := m[2]
+		bang := m[3]
+
+		// Skip macro invocations (ending with !)
+		if bang == "!" {
+			continue
+		}
+
+		// Skip keywords
+		if callKeywords[name] {
+			continue
+		}
+		// Skip if the qualifier is a keyword
+		if qualifier != "" && callKeywords[qualifier] {
+			continue
+		}
+
+		var target string
+		if qualifier != "" {
+			target = qualifier + "." + name
+		} else {
+			target = name
+		}
+
+		if !seen[target] {
+			seen[target] = true
+			calls = append(calls, target)
+		}
+	}
+
+	return calls
+}
+
+// --- impl relation merging ---
 
 // implRelation is a temporary holder for "impl Trait for Type" relations.
 // It generates a synthetic fact that gets merged onto the real type fact.
@@ -795,107 +1032,6 @@ func mergeImplRelations(ff []facts.Fact) []facts.Fact {
 	}
 
 	return cleaned
-}
-
-// extractAttributes extracts non-derive, non-cfg attribute macros from a line.
-// Returns the inner content of each #[...] attribute (e.g. "tokio::main", "serde(rename_all = \"camelCase\")").
-func extractAttributes(line string) []string {
-	matches := attrRe.FindAllStringSubmatch(line, -1)
-	var attrs []string
-	for _, m := range matches {
-		content := strings.TrimSpace(m[1])
-		// Skip derive (handled separately) and cfg (handled separately)
-		if strings.HasPrefix(content, "derive(") || strings.HasPrefix(content, "cfg(") {
-			continue
-		}
-		// Skip doc attributes (they're comments, not proc macros)
-		if strings.HasPrefix(content, "doc") {
-			continue
-		}
-		// Skip macro_export (handled with macro_rules!)
-		if content == "macro_export" {
-			continue
-		}
-		attrs = append(attrs, content)
-	}
-	return attrs
-}
-
-// applyPendingAttrs sets the "attributes" property on a fact if there are pending attributes.
-func applyPendingAttrs(f *facts.Fact, attrs []string) {
-	if len(attrs) > 0 {
-		// Copy to avoid sharing the slice
-		cp := make([]string, len(attrs))
-		copy(cp, attrs)
-		f.Props["attributes"] = cp
-	}
-}
-
-// parseDeriveLine splits "Debug, Clone, PartialEq" into individual trait names.
-func parseDeriveLine(s string) []string {
-	var result []string
-	for _, part := range strings.Split(s, ",") {
-		t := strings.TrimSpace(part)
-		if t != "" {
-			result = append(result, t)
-		}
-	}
-	return result
-}
-
-// Keywords that look like function calls but aren't.
-var callKeywords = map[string]bool{
-	"if": true, "while": true, "for": true, "match": true,
-	"return": true, "let": true, "else": true, "unsafe": true,
-	"async": true, "await": true, "move": true, "loop": true,
-	"fn": true, "pub": true, "use": true, "mod": true,
-	"struct": true, "enum": true, "trait": true, "impl": true,
-	"type": true, "const": true, "static": true, "where": true,
-	"as": true, "in": true, "ref": true, "mut": true,
-	"Some": true, "None": true, "Ok": true, "Err": true,
-	"Box": true, "Vec": true, "Arc": true, "Rc": true,
-}
-
-// extractCalls extracts function/method call targets from a single line of Rust code.
-// Returns slice of call targets in dotted form: "func", "qualifier.func".
-func extractCalls(line string) []string {
-	matches := callRe.FindAllStringSubmatch(line, -1)
-	var calls []string
-	seen := make(map[string]bool)
-
-	for _, m := range matches {
-		qualifier := m[1]
-		name := m[2]
-		bang := m[3]
-
-		// Skip macro invocations (ending with !)
-		if bang == "!" {
-			continue
-		}
-
-		// Skip keywords
-		if callKeywords[name] {
-			continue
-		}
-		// Skip if the qualifier is a keyword
-		if qualifier != "" && callKeywords[qualifier] {
-			continue
-		}
-
-		var target string
-		if qualifier != "" {
-			target = qualifier + "." + name
-		} else {
-			target = name
-		}
-
-		if !seen[target] {
-			seen[target] = true
-			calls = append(calls, target)
-		}
-	}
-
-	return calls
 }
 
 func isRustFile(path string) bool {
