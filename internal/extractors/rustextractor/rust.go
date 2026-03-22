@@ -92,6 +92,14 @@ func (e *RustExtractor) Extract(ctx context.Context, repoPath string, files []st
 	// Resolve crate:: imports to module directory paths.
 	allFacts = resolveCratePathImports(allFacts, modules)
 
+	// Build module hierarchy from mod declarations (e.g., `mod handlers;`)
+	// This creates parent→child module relationships for the architectural graph.
+	modDeclsByDir := collectModDeclarations(allFacts)
+	for dir, decls := range modDeclsByDir {
+		hierarchyFacts := buildModuleHierarchy(dir, decls.names, decls.file)
+		allFacts = append(allFacts, hierarchyFacts...)
+	}
+
 	for dir := range modules {
 		allFacts = append(allFacts, facts.Fact{
 			Kind: facts.KindModule,
@@ -346,6 +354,88 @@ func nodeName(node *sitter.Node, src []byte) string {
 	return ""
 }
 
+// mergeStringSlices merges two string slices, deduplicating values.
+func mergeStringSlices(a, b []string) []string {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	seen := make(map[string]bool, len(a))
+	result := make([]string, 0, len(a)+len(b))
+	for _, s := range a {
+		if !seen[s] {
+			seen[s] = true
+			result = append(result, s)
+		}
+	}
+	for _, s := range b {
+		if !seen[s] {
+			seen[s] = true
+			result = append(result, s)
+		}
+	}
+	return result
+}
+
+// mergeBoundsMap merges two bounds maps (type param → trait bounds).
+func mergeBoundsMap(a, b map[string][]string) map[string][]string {
+	if len(a) == 0 {
+		return b
+	}
+	if len(b) == 0 {
+		return a
+	}
+	result := make(map[string][]string, len(a)+len(b))
+	for k, v := range a {
+		result[k] = v
+	}
+	for k, v := range b {
+		if existing, ok := result[k]; ok {
+			result[k] = append(existing, v...)
+		} else {
+			result[k] = v
+		}
+	}
+	return result
+}
+
+// modDeclInfo holds mod declaration names and the declaring file for a directory.
+type modDeclInfo struct {
+	names []string
+	file  string
+}
+
+// collectModDeclarations scans extracted facts for external mod declarations
+// (symbol_kind="module", mod_style="external") and groups them by directory.
+func collectModDeclarations(ff []facts.Fact) map[string]modDeclInfo {
+	result := make(map[string]modDeclInfo)
+	for _, f := range ff {
+		if f.Kind != facts.KindSymbol {
+			continue
+		}
+		sk, _ := f.Props["symbol_kind"].(string)
+		ms, _ := f.Props["mod_style"].(string)
+		if sk != "module" || ms != "external" {
+			continue
+		}
+		dir := filepath.Dir(f.File)
+		// Extract mod name from fact name "dir.modname"
+		prefix := dir + "."
+		if !strings.HasPrefix(f.Name, prefix) {
+			continue
+		}
+		modName := f.Name[len(prefix):]
+
+		info := result[dir]
+		info.names = append(info.names, modName)
+		info.file = f.File
+		result[dir] = info
+	}
+	return result
+}
+
 // --- use_declaration ---
 
 func extractUseDecl(node *sitter.Node, src []byte, relFile, dir string) []facts.Fact {
@@ -431,6 +521,24 @@ func extractFunctionItem(node *sitter.Node, src []byte, relFile, dir string, isM
 		ff.Props["unsafe"] = true
 	}
 
+	// Wire generics: type params, lifetimes, bounds, where clause, return type
+	typeParams, lifetimes, bounds := extractTypeParams(node, src)
+	if len(typeParams) > 0 {
+		ff.Props["type_params"] = typeParams
+	}
+	if len(lifetimes) > 0 {
+		ff.Props["lifetimes"] = lifetimes
+	}
+	if len(bounds) > 0 {
+		ff.Props["bounds"] = bounds
+	}
+	if wc := extractWhereClause(node, src); wc != "" {
+		ff.Props["where_clause"] = wc
+	}
+	if rt := extractReturnType(node, src); rt != "" {
+		ff.Props["return_type"] = rt
+	}
+
 	// Extract calls from the function body
 	block := treesitter.FindChildByKind(node, "block")
 	if block != nil {
@@ -456,7 +564,7 @@ func extractStructItem(node *sitter.Node, src []byte, relFile, dir string) facts
 	}
 	exported := hasVisibility(node)
 
-	return facts.Fact{
+	ff := facts.Fact{
 		Kind: facts.KindSymbol,
 		Name: dir + "." + nameStr,
 		File: relFile,
@@ -470,6 +578,23 @@ func extractStructItem(node *sitter.Node, src []byte, relFile, dir string) facts
 			{Kind: facts.RelDeclares, Target: dir},
 		},
 	}
+
+	// Wire generics: type params, lifetimes, bounds, where clause
+	typeParams, lifetimes, bounds := extractTypeParams(node, src)
+	if len(typeParams) > 0 {
+		ff.Props["type_params"] = typeParams
+	}
+	if len(lifetimes) > 0 {
+		ff.Props["lifetimes"] = lifetimes
+	}
+	if len(bounds) > 0 {
+		ff.Props["bounds"] = bounds
+	}
+	if wc := extractWhereClause(node, src); wc != "" {
+		ff.Props["where_clause"] = wc
+	}
+
+	return ff
 }
 
 // --- enum_item ---
@@ -482,7 +607,7 @@ func extractEnumItem(node *sitter.Node, src []byte, relFile, dir string) facts.F
 	}
 	exported := hasVisibility(node)
 
-	return facts.Fact{
+	ff := facts.Fact{
 		Kind: facts.KindSymbol,
 		Name: dir + "." + nameStr,
 		File: relFile,
@@ -497,6 +622,23 @@ func extractEnumItem(node *sitter.Node, src []byte, relFile, dir string) facts.F
 			{Kind: facts.RelDeclares, Target: dir},
 		},
 	}
+
+	// Wire generics: type params, lifetimes, bounds, where clause
+	typeParams, lifetimes, bounds := extractTypeParams(node, src)
+	if len(typeParams) > 0 {
+		ff.Props["type_params"] = typeParams
+	}
+	if len(lifetimes) > 0 {
+		ff.Props["lifetimes"] = lifetimes
+	}
+	if len(bounds) > 0 {
+		ff.Props["bounds"] = bounds
+	}
+	if wc := extractWhereClause(node, src); wc != "" {
+		ff.Props["where_clause"] = wc
+	}
+
+	return ff
 }
 
 // --- union_item ---
@@ -536,7 +678,7 @@ func extractTraitItem(node *sitter.Node, src []byte, relFile, dir string) facts.
 	}
 	exported := hasVisibility(node)
 
-	return facts.Fact{
+	ff := facts.Fact{
 		Kind: facts.KindSymbol,
 		Name: dir + "." + nameStr,
 		File: relFile,
@@ -550,6 +692,23 @@ func extractTraitItem(node *sitter.Node, src []byte, relFile, dir string) facts.
 			{Kind: facts.RelDeclares, Target: dir},
 		},
 	}
+
+	// Wire generics: type params, lifetimes, bounds, where clause
+	typeParams, lifetimes, bounds := extractTypeParams(node, src)
+	if len(typeParams) > 0 {
+		ff.Props["type_params"] = typeParams
+	}
+	if len(lifetimes) > 0 {
+		ff.Props["lifetimes"] = lifetimes
+	}
+	if len(bounds) > 0 {
+		ff.Props["bounds"] = bounds
+	}
+	if wc := extractWhereClause(node, src); wc != "" {
+		ff.Props["where_clause"] = wc
+	}
+
+	return ff
 }
 
 // extractImplTypeNames extracts type names from an impl_item node.
@@ -613,6 +772,10 @@ func extractImplItem(node *sitter.Node, src []byte, relFile, dir string) []facts
 		typeName = typeNames[0]
 	}
 
+	// Extract impl-level generics (type params, lifetimes, where clause)
+	implTypeParams, implLifetimes, implBounds := extractTypeParams(node, src)
+	implWhereClause := extractWhereClause(node, src)
+
 	// If it's "impl Trait for Type", emit impl relation
 	if traitName != "" {
 		result = append(result, implRelation{
@@ -662,6 +825,30 @@ func extractImplItem(node *sitter.Node, src []byte, relFile, dir string) []facts
 		}
 		if isUnsafe {
 			ff.Props["unsafe"] = true
+		}
+
+		// Wire generics: merge impl-level and method-level type params
+		methodTypeParams, methodLifetimes, methodBounds := extractTypeParams(child, src)
+		allTypeParams := mergeStringSlices(implTypeParams, methodTypeParams)
+		allLifetimes := mergeStringSlices(implLifetimes, methodLifetimes)
+		allBounds := mergeBoundsMap(implBounds, methodBounds)
+		if len(allTypeParams) > 0 {
+			ff.Props["type_params"] = allTypeParams
+		}
+		if len(allLifetimes) > 0 {
+			ff.Props["lifetimes"] = allLifetimes
+		}
+		if len(allBounds) > 0 {
+			ff.Props["bounds"] = allBounds
+		}
+		// Method where clause takes precedence; fall back to impl-level
+		if wc := extractWhereClause(child, src); wc != "" {
+			ff.Props["where_clause"] = wc
+		} else if implWhereClause != "" {
+			ff.Props["where_clause"] = implWhereClause
+		}
+		if rt := extractReturnType(child, src); rt != "" {
+			ff.Props["return_type"] = rt
 		}
 
 		// Extract calls from method body

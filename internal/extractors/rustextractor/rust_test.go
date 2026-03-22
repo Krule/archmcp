@@ -2667,6 +2667,198 @@ pub fn run() {}
 	}
 }
 
+// --- Acceptance test: generics wired into pipeline (type_params in Props) ---
+// Verifies that extractTypeParams, extractWhereClause, extractReturnType
+// are actually called from the extraction pipeline and their results appear
+// in the fact Props map.
+
+func TestAcceptance_GenericsWiredIntoPipeline(t *testing.T) {
+	ff := extractFromString(t, `pub struct HashMap<K, V> {
+    data: Vec<(K, V)>,
+}
+
+pub enum Result<T, E> {
+    Ok(T),
+    Err(E),
+}
+
+pub fn transform<T: Clone, U>(input: T) -> U where U: From<T> {
+    U::from(input)
+}
+
+pub trait Iterator<Item> {
+    fn next(&mut self) -> Option<Item>;
+}
+
+pub struct Scanner<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Scanner<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    pub fn peek(&self) -> u8 {
+        0
+    }
+}
+`)
+
+	// 1. Struct with type_params
+	hm, ok := findFact(ff, "src.HashMap")
+	if !ok {
+		t.Fatal("expected fact for src.HashMap")
+	}
+	tp, _ := hm.Props["type_params"].([]string)
+	if len(tp) != 2 || tp[0] != "K" || tp[1] != "V" {
+		t.Errorf("HashMap type_params = %v, want [K V]", tp)
+	}
+
+	// 2. Enum with type_params
+	res, ok := findFact(ff, "src.Result")
+	if !ok {
+		t.Fatal("expected fact for src.Result")
+	}
+	tp, _ = res.Props["type_params"].([]string)
+	if len(tp) != 2 || tp[0] != "T" || tp[1] != "E" {
+		t.Errorf("Result type_params = %v, want [T E]", tp)
+	}
+
+	// 3. Function with type_params, bounds, where_clause, return_type
+	xform, ok := findFact(ff, "src.transform")
+	if !ok {
+		t.Fatal("expected fact for src.transform")
+	}
+	tp, _ = xform.Props["type_params"].([]string)
+	if len(tp) != 2 || tp[0] != "T" || tp[1] != "U" {
+		t.Errorf("transform type_params = %v, want [T U]", tp)
+	}
+	bounds, _ := xform.Props["bounds"].(map[string][]string)
+	if bounds == nil || len(bounds["T"]) == 0 {
+		t.Errorf("transform bounds = %v, want T: [Clone]", bounds)
+	}
+	wc, _ := xform.Props["where_clause"].(string)
+	if wc == "" {
+		t.Error("transform where_clause should not be empty")
+	}
+	rt, _ := xform.Props["return_type"].(string)
+	if rt != "U" {
+		t.Errorf("transform return_type = %q, want U", rt)
+	}
+
+	// 4. Trait with type_params
+	iter, ok := findFact(ff, "src.Iterator")
+	if !ok {
+		t.Fatal("expected fact for src.Iterator")
+	}
+	tp, _ = iter.Props["type_params"].([]string)
+	if len(tp) != 1 || tp[0] != "Item" {
+		t.Errorf("Iterator type_params = %v, want [Item]", tp)
+	}
+
+	// 5. Struct with lifetime
+	scanner, ok := findFact(ff, "src.Scanner")
+	if !ok {
+		t.Fatal("expected fact for src.Scanner")
+	}
+	lts, _ := scanner.Props["lifetimes"].([]string)
+	if len(lts) != 1 || lts[0] != "'a" {
+		t.Errorf("Scanner lifetimes = %v, want ['a]", lts)
+	}
+
+	// 6. Impl method gets impl-level lifetimes + return_type
+	newFn, ok := findFact(ff, "src.Scanner.new")
+	if !ok {
+		t.Fatal("expected method fact for src.Scanner.new")
+	}
+	lts, _ = newFn.Props["lifetimes"].([]string)
+	if len(lts) != 1 || lts[0] != "'a" {
+		t.Errorf("Scanner.new lifetimes = %v, want ['a] (inherited from impl)", lts)
+	}
+	rt, _ = newFn.Props["return_type"].(string)
+	if rt != "Self" {
+		t.Errorf("Scanner.new return_type = %q, want Self", rt)
+	}
+
+	// 7. Method return type
+	peekFn, ok := findFact(ff, "src.Scanner.peek")
+	if !ok {
+		t.Fatal("expected method fact for src.Scanner.peek")
+	}
+	rt, _ = peekFn.Props["return_type"].(string)
+	if rt != "u8" {
+		t.Errorf("Scanner.peek return_type = %q, want u8", rt)
+	}
+}
+
+// --- Acceptance test: module hierarchy wired into pipeline ---
+// Verifies that buildModuleHierarchy is called from Extract() and
+// produces module facts with parent_module relationships.
+
+func TestAcceptance_ModuleHierarchyWiredIntoPipeline(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(dir, "src", "handlers"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte("[package]\nname = \"testcrate\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// lib.rs declares mod handlers; and mod utils;
+	libRs := `pub mod handlers;
+mod utils;
+`
+	if err := os.WriteFile(filepath.Join(dir, "src", "lib.rs"), []byte(libRs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// handlers/mod.rs declares mod routes;
+	handlersModRs := `pub mod routes;
+`
+	if err := os.WriteFile(filepath.Join(dir, "src", "handlers", "mod.rs"), []byte(handlersModRs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ext := New()
+	allFacts, err := ext.Extract(context.Background(), dir, []string{
+		"src/lib.rs",
+		"src/handlers/mod.rs",
+	})
+	if err != nil {
+		t.Fatalf("Extract error: %v", err)
+	}
+
+	modules := findFactByKind(allFacts, facts.KindModule)
+
+	// Check for hierarchy-derived module facts with parent_module
+	foundHandlersHierarchy := false
+	foundUtilsHierarchy := false
+	foundRoutesHierarchy := false
+	for _, m := range modules {
+		parent, _ := m.Props["parent_module"].(string)
+		switch {
+		case m.Name == "src/handlers" && parent == "src":
+			foundHandlersHierarchy = true
+		case m.Name == "src/utils" && parent == "src":
+			foundUtilsHierarchy = true
+		case m.Name == "src/handlers/routes" && parent == "src/handlers":
+			foundRoutesHierarchy = true
+		}
+	}
+
+	if !foundHandlersHierarchy {
+		t.Error("expected module hierarchy fact for src/handlers with parent_module=src")
+	}
+	if !foundUtilsHierarchy {
+		t.Error("expected module hierarchy fact for src/utils with parent_module=src")
+	}
+	if !foundRoutesHierarchy {
+		t.Error("expected module hierarchy fact for src/handlers/routes with parent_module=src/handlers")
+	}
+}
+
 // containsStr checks if a string slice contains a specific value.
 func containsStr(ss []string, target string) bool {
 	for _, s := range ss {
