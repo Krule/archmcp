@@ -651,7 +651,7 @@ func extractUnionItem(node *sitter.Node, src []byte, relFile, dir string) facts.
 	}
 	exported := hasVisibility(node)
 
-	return facts.Fact{
+	ff := facts.Fact{
 		Kind: facts.KindSymbol,
 		Name: dir + "." + nameStr,
 		File: relFile,
@@ -666,6 +666,23 @@ func extractUnionItem(node *sitter.Node, src []byte, relFile, dir string) facts.
 			{Kind: facts.RelDeclares, Target: dir},
 		},
 	}
+
+	// Wire generics: type params, lifetimes, bounds, where clause
+	typeParams, lifetimes, bounds := extractTypeParams(node, src)
+	if len(typeParams) > 0 {
+		ff.Props["type_params"] = typeParams
+	}
+	if len(lifetimes) > 0 {
+		ff.Props["lifetimes"] = lifetimes
+	}
+	if len(bounds) > 0 {
+		ff.Props["bounds"] = bounds
+	}
+	if wc := extractWhereClause(node, src); wc != "" {
+		ff.Props["where_clause"] = wc
+	}
+
+	return ff
 }
 
 // --- trait_item ---
@@ -927,7 +944,7 @@ func extractTypeItem(node *sitter.Node, src []byte, relFile, dir string) facts.F
 	}
 	exported := hasVisibility(node)
 
-	return facts.Fact{
+	ff := facts.Fact{
 		Kind: facts.KindSymbol,
 		Name: dir + "." + nameStr,
 		File: relFile,
@@ -941,6 +958,23 @@ func extractTypeItem(node *sitter.Node, src []byte, relFile, dir string) facts.F
 			{Kind: facts.RelDeclares, Target: dir},
 		},
 	}
+
+	// Wire generics: type params, lifetimes, bounds, where clause
+	typeParams, lifetimes, bounds := extractTypeParams(node, src)
+	if len(typeParams) > 0 {
+		ff.Props["type_params"] = typeParams
+	}
+	if len(lifetimes) > 0 {
+		ff.Props["lifetimes"] = lifetimes
+	}
+	if len(bounds) > 0 {
+		ff.Props["bounds"] = bounds
+	}
+	if wc := extractWhereClause(node, src); wc != "" {
+		ff.Props["where_clause"] = wc
+	}
+
+	return ff
 }
 
 // --- macro_definition ---

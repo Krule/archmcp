@@ -2703,6 +2703,13 @@ impl<'a> Scanner<'a> {
         0
     }
 }
+
+pub union TaggedPtr<T> {
+    ptr: *const T,
+    tag: usize,
+}
+
+pub type BoxFuture<'a, T> = Box<dyn Future<Output = T> + 'a>;
 `)
 
 	// 1. Struct with type_params
@@ -2790,6 +2797,30 @@ impl<'a> Scanner<'a> {
 	if rt != "u8" {
 		t.Errorf("Scanner.peek return_type = %q, want u8", rt)
 	}
+
+	// 8. Union with type_params (was missing generics wiring)
+	taggedPtr, ok := findFact(ff, "src.TaggedPtr")
+	if !ok {
+		t.Fatal("expected fact for src.TaggedPtr")
+	}
+	tp, _ = taggedPtr.Props["type_params"].([]string)
+	if len(tp) != 1 || tp[0] != "T" {
+		t.Errorf("TaggedPtr type_params = %v, want [T]", tp)
+	}
+
+	// 9. Type alias with lifetime + type param (was missing generics wiring)
+	boxFuture, ok := findFact(ff, "src.BoxFuture")
+	if !ok {
+		t.Fatal("expected fact for src.BoxFuture")
+	}
+	bfLts, _ := boxFuture.Props["lifetimes"].([]string)
+	if len(bfLts) != 1 || bfLts[0] != "'a" {
+		t.Errorf("BoxFuture lifetimes = %v, want ['a]", bfLts)
+	}
+	bfTp, _ := boxFuture.Props["type_params"].([]string)
+	if len(bfTp) != 1 || bfTp[0] != "T" {
+		t.Errorf("BoxFuture type_params = %v, want [T]", bfTp)
+	}
 }
 
 // --- Acceptance test: module hierarchy wired into pipeline ---
@@ -2856,6 +2887,69 @@ mod utils;
 	}
 	if !foundRoutesHierarchy {
 		t.Error("expected module hierarchy fact for src/handlers/routes with parent_module=src/handlers")
+	}
+}
+
+// --- Regression test: union and type alias generics ---
+// Verifies that extractUnionItem and extractTypeItem wire generics into Props.
+// These were missing generics wiring even after struct/enum/fn/trait/impl were fixed.
+
+func TestExtractFile_UnionWithGenerics(t *testing.T) {
+	ff := extractFromString(t, `pub union TaggedPtr<T> {
+    ptr: *const T,
+    tag: usize,
+}
+`)
+	f, ok := findFact(ff, "src.TaggedPtr")
+	if !ok {
+		t.Fatal("expected fact for src.TaggedPtr")
+	}
+	tp, _ := f.Props["type_params"].([]string)
+	if len(tp) != 1 || tp[0] != "T" {
+		t.Errorf("TaggedPtr type_params = %v, want [T]", tp)
+	}
+}
+
+func TestExtractFile_UnionWithLifetime(t *testing.T) {
+	ff := extractFromString(t, `pub union BorrowedData<'a> {
+    slice: &'a [u8],
+    ptr: *const u8,
+}
+`)
+	f, ok := findFact(ff, "src.BorrowedData")
+	if !ok {
+		t.Fatal("expected fact for src.BorrowedData")
+	}
+	lts, _ := f.Props["lifetimes"].([]string)
+	if len(lts) != 1 || lts[0] != "'a" {
+		t.Errorf("BorrowedData lifetimes = %v, want ['a]", lts)
+	}
+}
+
+func TestExtractFile_TypeAliasWithGenerics(t *testing.T) {
+	ff := extractFromString(t, `pub type Result<T> = std::result::Result<T, MyError>;
+type BoxFuture<'a, T> = Box<dyn Future<Output = T> + 'a>;
+`)
+	r, ok := findFact(ff, "src.Result")
+	if !ok {
+		t.Fatal("expected fact for src.Result")
+	}
+	tp, _ := r.Props["type_params"].([]string)
+	if len(tp) != 1 || tp[0] != "T" {
+		t.Errorf("Result type_params = %v, want [T]", tp)
+	}
+
+	bf, ok := findFact(ff, "src.BoxFuture")
+	if !ok {
+		t.Fatal("expected fact for src.BoxFuture")
+	}
+	bfLts, _ := bf.Props["lifetimes"].([]string)
+	if len(bfLts) != 1 || bfLts[0] != "'a" {
+		t.Errorf("BoxFuture lifetimes = %v, want ['a]", bfLts)
+	}
+	bfTp, _ := bf.Props["type_params"].([]string)
+	if len(bfTp) != 1 || bfTp[0] != "T" {
+		t.Errorf("BoxFuture type_params = %v, want [T]", bfTp)
 	}
 }
 
