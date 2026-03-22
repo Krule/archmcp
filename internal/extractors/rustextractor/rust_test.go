@@ -1154,7 +1154,7 @@ mod tests {
 		for _, r := range d.Relations {
 			if r.Kind == facts.RelImports {
 				switch {
-				case r.Target == "crate::handlers::user" || r.Target == "handlers/user":
+				case r.Target == "crate::handlers::user" || r.Target == "handlers/user" || r.Target == "src/handlers":
 					foundCrateImport = true
 				case r.Target == "serde":
 					foundSerdeImport = true
@@ -1818,8 +1818,8 @@ fn callee() {}
 	if !ok {
 		t.Fatal("expected fact for src.caller")
 	}
-	if !hasRelation(f, facts.RelCalls, "callee") {
-		t.Error("caller missing calls relation for callee")
+	if !hasRelation(f, facts.RelCalls, "src.callee") {
+		t.Error("caller missing calls relation for src.callee (resolved)")
 	}
 }
 
@@ -1841,11 +1841,11 @@ fn helper() {}
 	if !ok {
 		t.Fatal("expected method fact for src.Foo.bar")
 	}
-	if !hasRelation(bar, facts.RelCalls, "self.baz") {
-		t.Error("Foo.bar missing calls relation for self.baz")
+	if !hasRelation(bar, facts.RelCalls, "src.Foo.baz") {
+		t.Error("Foo.bar missing calls relation for src.Foo.baz (self.baz resolved)")
 	}
-	if !hasRelation(bar, facts.RelCalls, "helper") {
-		t.Error("Foo.bar missing calls relation for helper")
+	if !hasRelation(bar, facts.RelCalls, "src.helper") {
+		t.Error("Foo.bar missing calls relation for src.helper (resolved)")
 	}
 }
 
@@ -1863,7 +1863,7 @@ func TestExtractFile_NoCallsForMacros(t *testing.T) {
 	if hasRelation(f, facts.RelCalls, "println") {
 		t.Error("should not have calls relation for macro println!")
 	}
-	if !hasRelation(f, facts.RelCalls, "real_call") {
+	if !hasRelation(f, facts.RelCalls, "real_call") && !hasRelation(f, facts.RelCalls, "src.real_call") {
 		t.Error("missing calls relation for real_call")
 	}
 }
@@ -1919,31 +1919,31 @@ impl Service {
 }
 `)
 
-	// 1. Top-level fn main should call setup_logging (simple call)
+	// 1. Top-level fn main should call setup_logging → resolved to "src.setup_logging"
 	mainFn, ok := findFact(ff, "src.main")
 	if !ok {
 		t.Fatal("expected fact for src.main")
 	}
-	if !hasRelation(mainFn, facts.RelCalls, "setup_logging") {
-		t.Error("main missing calls relation for setup_logging")
+	if !hasRelation(mainFn, facts.RelCalls, "src.setup_logging") {
+		t.Error("main missing calls relation for src.setup_logging")
 	}
 
-	// 2. main should call Config::load (associated function / qualified)
-	if !hasRelation(mainFn, facts.RelCalls, "Config.load") {
-		t.Error("main missing calls relation for Config.load")
+	// 2. main should call Config::load → resolved to "src.Config.load"
+	if !hasRelation(mainFn, facts.RelCalls, "src.Config.load") {
+		t.Error("main missing calls relation for src.Config.load")
 	}
 
-	// 3. main should call Service::new (associated function)
-	if !hasRelation(mainFn, facts.RelCalls, "Service.new") {
-		t.Error("main missing calls relation for Service.new")
+	// 3. main should call Service::new → resolved to "src.Service.new"
+	if !hasRelation(mainFn, facts.RelCalls, "src.Service.new") {
+		t.Error("main missing calls relation for src.Service.new")
 	}
 
-	// 4. main should call svc.run (method call)
+	// 4. main should call svc.run — "svc" is a variable, type unknown, kept as-is
 	if !hasRelation(mainFn, facts.RelCalls, "svc.run") {
-		t.Error("main missing calls relation for svc.run")
+		t.Error("main missing calls relation for svc.run (unresolvable variable)")
 	}
 
-	// 5. main should call io::stdout → io.stdout (qualified call)
+	// 5. main should call io::stdout → io.stdout (external, unresolvable, kept as-is)
 	if !hasRelation(mainFn, facts.RelCalls, "io.stdout") {
 		t.Error("main missing calls relation for io.stdout")
 	}
@@ -1953,37 +1953,37 @@ impl Service {
 		t.Error("main should not have calls relation for macro println!")
 	}
 
-	// 7. setup_logging should call init_tracing
+	// 7. setup_logging should call init_tracing → resolved to "src.init_tracing"
 	setupFn, ok := findFact(ff, "src.setup_logging")
 	if !ok {
 		t.Fatal("expected fact for src.setup_logging")
 	}
-	if !hasRelation(setupFn, facts.RelCalls, "init_tracing") {
-		t.Error("setup_logging missing calls relation for init_tracing")
+	if !hasRelation(setupFn, facts.RelCalls, "src.init_tracing") {
+		t.Error("setup_logging missing calls relation for src.init_tracing")
 	}
 
-	// 8. Service.run should call self.handle_request → self.handle_request
+	// 8. Service.run should call self.handle_request → resolved to "src.Service.handle_request"
 	runMethod, ok := findFact(ff, "src.Service.run")
 	if !ok {
 		t.Fatal("expected method fact for src.Service.run")
 	}
-	if !hasRelation(runMethod, facts.RelCalls, "self.handle_request") {
-		t.Error("Service.run missing calls relation for self.handle_request")
+	if !hasRelation(runMethod, facts.RelCalls, "src.Service.handle_request") {
+		t.Error("Service.run missing calls relation for src.Service.handle_request")
 	}
 
-	// 9. Service.run should call helper::process → helper.process
+	// 9. Service.run should call helper::process → helper.process (unresolvable, kept as-is)
 	if !hasRelation(runMethod, facts.RelCalls, "helper.process") {
 		t.Error("Service.run missing calls relation for helper.process")
 	}
 
-	// 10. Service.run should call self.cfg_valid
-	if !hasRelation(runMethod, facts.RelCalls, "self.cfg_valid") {
-		t.Error("Service.run missing calls relation for self.cfg_valid")
+	// 10. Service.run should call self.cfg_valid → resolved to "src.Service.cfg_valid"
+	if !hasRelation(runMethod, facts.RelCalls, "src.Service.cfg_valid") {
+		t.Error("Service.run missing calls relation for src.Service.cfg_valid")
 	}
 
-	// 11. Service.run should call self.start_server
-	if !hasRelation(runMethod, facts.RelCalls, "self.start_server") {
-		t.Error("Service.run missing calls relation for self.start_server")
+	// 11. Service.run should call self.start_server → resolved to "src.Service.start_server"
+	if !hasRelation(runMethod, facts.RelCalls, "src.Service.start_server") {
+		t.Error("Service.run missing calls relation for src.Service.start_server")
 	}
 
 	// 12. init_tracing has no calls (empty body)
@@ -2124,6 +2124,546 @@ fn old_fn() {}
 	if _, ok := findFact(ff, "src.it_works"); !ok {
 		// it_works is NOT inside cfg(test), so it should exist
 		t.Fatal("it_works should exist (it's a standalone #[test], not inside cfg(test) block)")
+	}
+}
+
+// --- Unit tests: resolveCallTargets ---
+
+func TestResolveCallTargets_SimpleCall(t *testing.T) {
+	ff := []facts.Fact{
+		{Kind: facts.KindSymbol, Name: "src.caller", File: "src/main.rs", Props: map[string]any{"symbol_kind": facts.SymbolFunc},
+			Relations: []facts.Relation{{Kind: facts.RelCalls, Target: "callee"}}},
+		{Kind: facts.KindSymbol, Name: "src.callee", File: "src/main.rs", Props: map[string]any{"symbol_kind": facts.SymbolFunc}},
+	}
+	resolved := resolveCallTargets(ff)
+	caller := resolved[0]
+	if !hasRelation(caller, facts.RelCalls, "src.callee") {
+		t.Errorf("expected call to src.callee, got relations: %v", caller.Relations)
+	}
+}
+
+func TestResolveCallTargets_QualifiedCall(t *testing.T) {
+	ff := []facts.Fact{
+		{Kind: facts.KindSymbol, Name: "src.main", File: "src/main.rs", Props: map[string]any{"symbol_kind": facts.SymbolFunc},
+			Relations: []facts.Relation{{Kind: facts.RelCalls, Target: "Config.load"}}},
+		{Kind: facts.KindSymbol, Name: "src.Config.load", File: "src/main.rs", Props: map[string]any{"symbol_kind": facts.SymbolMethod, "receiver": "Config"}},
+	}
+	resolved := resolveCallTargets(ff)
+	main := resolved[0]
+	if !hasRelation(main, facts.RelCalls, "src.Config.load") {
+		t.Errorf("expected call to src.Config.load, got relations: %v", main.Relations)
+	}
+}
+
+func TestResolveCallTargets_SelfCall(t *testing.T) {
+	ff := []facts.Fact{
+		{Kind: facts.KindSymbol, Name: "src.Foo.bar", File: "src/main.rs",
+			Props:     map[string]any{"symbol_kind": facts.SymbolMethod, "receiver": "Foo"},
+			Relations: []facts.Relation{{Kind: facts.RelCalls, Target: "self.baz"}}},
+		{Kind: facts.KindSymbol, Name: "src.Foo.baz", File: "src/main.rs",
+			Props: map[string]any{"symbol_kind": facts.SymbolMethod, "receiver": "Foo"}},
+	}
+	resolved := resolveCallTargets(ff)
+	bar := resolved[0]
+	if !hasRelation(bar, facts.RelCalls, "src.Foo.baz") {
+		t.Errorf("expected self.baz to resolve to src.Foo.baz, got relations: %v", bar.Relations)
+	}
+}
+
+func TestResolveCallTargets_UnresolvedKept(t *testing.T) {
+	ff := []facts.Fact{
+		{Kind: facts.KindSymbol, Name: "src.main", File: "src/main.rs", Props: map[string]any{"symbol_kind": facts.SymbolFunc},
+			Relations: []facts.Relation{{Kind: facts.RelCalls, Target: "external_crate.function"}}},
+	}
+	resolved := resolveCallTargets(ff)
+	main := resolved[0]
+	// Should keep unresolvable target as-is
+	if !hasRelation(main, facts.RelCalls, "external_crate.function") {
+		t.Errorf("unresolvable target should be kept as-is, got relations: %v", main.Relations)
+	}
+}
+
+func TestResolveCallTargets_NonCallRelationsUntouched(t *testing.T) {
+	ff := []facts.Fact{
+		{Kind: facts.KindSymbol, Name: "src.Foo", File: "src/main.rs", Props: map[string]any{"symbol_kind": facts.SymbolStruct},
+			Relations: []facts.Relation{
+				{Kind: facts.RelDeclares, Target: "src"},
+				{Kind: facts.RelImplements, Target: "Debug"},
+			}},
+	}
+	resolved := resolveCallTargets(ff)
+	foo := resolved[0]
+	if !hasRelation(foo, facts.RelDeclares, "src") {
+		t.Error("declares relation should be untouched")
+	}
+	if !hasRelation(foo, facts.RelImplements, "Debug") {
+		t.Error("implements relation should be untouched")
+	}
+}
+
+// --- Acceptance test: call target resolution ---
+// Call targets must be resolved to fact names so that cohesion/coupling/dead-code
+// analyses can link callers to callees. Without resolution, cohesion sees every
+// function as a disconnected component (the parser repo shows 0.00 cohesion everywhere).
+
+func TestAcceptance_CallTargetResolution(t *testing.T) {
+	ff := extractFromString(t, `pub fn main() {
+    setup_logging();
+    let cfg = Config::load();
+    let svc = Service::new(cfg);
+    svc.run();
+}
+
+fn setup_logging() {
+    init_tracing();
+}
+
+fn init_tracing() {}
+
+pub struct Config {}
+
+impl Config {
+    pub fn load() -> Self {
+        Self {}
+    }
+}
+
+pub struct Service {
+    cfg: Config,
+}
+
+impl Service {
+    pub fn new(cfg: Config) -> Self {
+        Self { cfg }
+    }
+
+    pub fn run(&self) {
+        self.handle_request();
+        self.cfg_valid();
+        self.start_server();
+    }
+
+    fn handle_request(&self) {}
+    fn cfg_valid(&self) -> bool { true }
+    fn start_server(&self) {}
+}
+`)
+
+	// 1. Simple function call: setup_logging() → resolved to "src.setup_logging"
+	mainFn, ok := findFact(ff, "src.main")
+	if !ok {
+		t.Fatal("expected fact for src.main")
+	}
+	if !hasRelation(mainFn, facts.RelCalls, "src.setup_logging") {
+		t.Error("main: setup_logging() should resolve to src.setup_logging")
+	}
+
+	// 2. Associated function: Config::load() → resolved to "src.Config.load"
+	if !hasRelation(mainFn, facts.RelCalls, "src.Config.load") {
+		t.Error("main: Config::load() should resolve to src.Config.load")
+	}
+
+	// 3. Associated function: Service::new() → resolved to "src.Service.new"
+	if !hasRelation(mainFn, facts.RelCalls, "src.Service.new") {
+		t.Error("main: Service::new() should resolve to src.Service.new")
+	}
+
+	// 4. Variable method call: svc.run() → resolved to "src.Service.run"
+	//    (svc is unknown type, but Service.run exists and "run" matches)
+	//    NOTE: if type can't be inferred, we keep "svc.run" unresolved — that's acceptable
+	//    The critical case is self.method() resolution.
+
+	// 5. Transitive: setup_logging() calls init_tracing() → "src.init_tracing"
+	setupFn, ok := findFact(ff, "src.setup_logging")
+	if !ok {
+		t.Fatal("expected fact for src.setup_logging")
+	}
+	if !hasRelation(setupFn, facts.RelCalls, "src.init_tracing") {
+		t.Error("setup_logging: init_tracing() should resolve to src.init_tracing")
+	}
+
+	// 6. self.method() calls in impl → resolved to "src.Service.handle_request" etc.
+	runMethod, ok := findFact(ff, "src.Service.run")
+	if !ok {
+		t.Fatal("expected method fact for src.Service.run")
+	}
+	if !hasRelation(runMethod, facts.RelCalls, "src.Service.handle_request") {
+		t.Error("Service.run: self.handle_request() should resolve to src.Service.handle_request")
+	}
+	if !hasRelation(runMethod, facts.RelCalls, "src.Service.cfg_valid") {
+		t.Error("Service.run: self.cfg_valid() should resolve to src.Service.cfg_valid")
+	}
+	if !hasRelation(runMethod, facts.RelCalls, "src.Service.start_server") {
+		t.Error("Service.run: self.start_server() should resolve to src.Service.start_server")
+	}
+
+	// 7. init_tracing still has no calls (empty body — verify no false positives)
+	initFn, ok := findFact(ff, "src.init_tracing")
+	if !ok {
+		t.Fatal("expected fact for src.init_tracing")
+	}
+	for _, r := range initFn.Relations {
+		if r.Kind == facts.RelCalls {
+			t.Errorf("init_tracing should have no calls, found: %s", r.Target)
+		}
+	}
+}
+
+// --- Unit test: generic impl block methods ---
+
+func TestExtractFile_GenericImplBlock(t *testing.T) {
+	ff := extractFromString(t, `pub struct Scanner<'a> {
+    data: &'a [u8],
+}
+
+impl<'a> Scanner<'a> {
+    pub fn new(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
+    fn peek(&self) -> u8 {
+        0
+    }
+
+    fn advance(&mut self) {
+        self.peek();
+    }
+}
+`)
+	// Methods should have receiver = "Scanner" (stripped of generics)
+	newFn, ok := findFact(ff, "src.Scanner.new")
+	if !ok {
+		t.Fatal("expected method fact for src.Scanner.new")
+	}
+	if newFn.Props["receiver"] != "Scanner" {
+		t.Errorf("Scanner.new receiver = %v, want Scanner", newFn.Props["receiver"])
+	}
+
+	peek, ok := findFact(ff, "src.Scanner.peek")
+	if !ok {
+		t.Fatal("expected method fact for src.Scanner.peek")
+	}
+	if peek.Props["receiver"] != "Scanner" {
+		t.Errorf("Scanner.peek receiver = %v, want Scanner", peek.Props["receiver"])
+	}
+
+	// self.peek() in advance should resolve to src.Scanner.peek
+	advance, ok := findFact(ff, "src.Scanner.advance")
+	if !ok {
+		t.Fatal("expected method fact for src.Scanner.advance")
+	}
+	if !hasRelation(advance, facts.RelCalls, "src.Scanner.peek") {
+		t.Error("Scanner.advance: self.peek() should resolve to src.Scanner.peek")
+		for _, r := range advance.Relations {
+			if r.Kind == facts.RelCalls {
+				t.Logf("  calls: %s", r.Target)
+			}
+		}
+	}
+}
+
+// --- Acceptance test: workspace cross-crate dependency resolution ---
+// In a Cargo workspace, `use other_crate::module::Symbol;` should create
+// a dependency edge from the importing module to the target crate's module.
+// Without this, coupling analysis reports 0% for all workspace crates.
+
+func TestAcceptance_WorkspaceCrossCrateDeps(t *testing.T) {
+	dir := t.TempDir()
+
+	// Root workspace Cargo.toml — also the "mylib" crate
+	rootCargo := `[workspace]
+members = ["crates/*"]
+
+[package]
+name = "mylib"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1"
+`
+	if err := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte(rootCargo), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Root crate source with a submodule
+	if err := os.MkdirAll(filepath.Join(dir, "src", "models"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "lib.rs"), []byte("pub mod models;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "models", "mod.rs"), []byte("pub fn load() {}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Member crate: mylib-cli depends on root crate via path
+	cliDir := filepath.Join(dir, "crates", "mylib-cli")
+	if err := os.MkdirAll(filepath.Join(cliDir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cliCargo := `[package]
+name = "mylib-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mylib = { path = "../.." }
+`
+	if err := os.WriteFile(filepath.Join(cliDir, "Cargo.toml"), []byte(cliCargo), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// CLI source: uses mylib::models (cross-crate import)
+	cliSrc := `use mylib::models;
+
+pub fn run() {
+    models::load();
+}
+`
+	if err := os.WriteFile(filepath.Join(cliDir, "src", "lib.rs"), []byte(cliSrc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ext := New()
+	files := []string{
+		"src/lib.rs",
+		"src/models/mod.rs",
+		"crates/mylib-cli/src/lib.rs",
+	}
+
+	allFacts, err := ext.Extract(context.Background(), dir, files)
+	if err != nil {
+		t.Fatalf("Extract error: %v", err)
+	}
+
+	// The import `use mylib::models` from crates/mylib-cli/src should
+	// create a dependency with target pointing to the resolved module "src/models"
+	// (because "mylib" is an internal path dep whose src is at the root "src/").
+	deps := findFactByKind(allFacts, facts.KindDependency)
+
+	foundCrossImport := false
+	for _, d := range deps {
+		if d.File != "crates/mylib-cli/src/lib.rs" {
+			continue
+		}
+		for _, r := range d.Relations {
+			if r.Kind == facts.RelImports && r.Target == "src/models" {
+				foundCrossImport = true
+			}
+		}
+	}
+	if !foundCrossImport {
+		t.Error("expected cross-crate import from mylib-cli → src/models (resolved through workspace)")
+		t.Log("Dependencies from cli/src/lib.rs:")
+		for _, d := range deps {
+			if d.File == "crates/mylib-cli/src/lib.rs" {
+				for _, r := range d.Relations {
+					t.Logf("  %s → %s", r.Kind, r.Target)
+				}
+			}
+		}
+	}
+}
+
+// --- Acceptance test: cross-file call resolution within a module ---
+// Functions in file A calling functions in file B (same directory/module)
+// must resolve to fact names so cohesion analysis can connect them.
+
+func TestAcceptance_CrossFileCallResolution(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte("[package]\nname = \"testcrate\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// File A: calls validate() which is defined in file B
+	fileA := `pub fn process(input: &str) -> bool {
+    validate(input)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "src", "process.rs"), []byte(fileA), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// File B: defines validate() and calls helper() from same file
+	fileB := `pub fn validate(input: &str) -> bool {
+    helper(input)
+}
+
+fn helper(input: &str) -> bool {
+    !input.is_empty()
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "src", "validate.rs"), []byte(fileB), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ext := New()
+	allFacts, err := ext.Extract(context.Background(), dir, []string{
+		"src/process.rs",
+		"src/validate.rs",
+	})
+	if err != nil {
+		t.Fatalf("Extract error: %v", err)
+	}
+
+	// process() in file A calls validate() in file B → should resolve to "src.validate"
+	processFn, ok := findFact(allFacts, "src.process")
+	if !ok {
+		t.Fatal("expected fact for src.process")
+	}
+	if !hasRelation(processFn, facts.RelCalls, "src.validate") {
+		t.Error("process() should have cross-file call to src.validate (defined in validate.rs)")
+		for _, r := range processFn.Relations {
+			if r.Kind == facts.RelCalls {
+				t.Logf("  calls: %s", r.Target)
+			}
+		}
+	}
+
+	// validate() calls helper() in same file → already resolved by per-file pass
+	validateFn, ok := findFact(allFacts, "src.validate")
+	if !ok {
+		t.Fatal("expected fact for src.validate")
+	}
+	if !hasRelation(validateFn, facts.RelCalls, "src.helper") {
+		t.Error("validate() should have same-file call to src.helper")
+	}
+}
+
+// --- Acceptance test: mod-relative use statements ---
+// `use sibling_mod::Symbol` where sibling_mod is a local `mod` declaration
+// should be classified as internal, not external.
+
+func TestAcceptance_ModRelativeUseStatements(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte("[package]\nname = \"testcrate\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// lib.rs declares mod utils; then uses utils::helper
+	libRs := `mod utils;
+
+use utils::helper;
+
+pub fn main() {
+    helper();
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "src", "lib.rs"), []byte(libRs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	utilsRs := `pub fn helper() {}
+`
+	if err := os.WriteFile(filepath.Join(dir, "src", "utils.rs"), []byte(utilsRs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ext := New()
+	allFacts, err := ext.Extract(context.Background(), dir, []string{
+		"src/lib.rs",
+		"src/utils.rs",
+	})
+	if err != nil {
+		t.Fatalf("Extract error: %v", err)
+	}
+
+	// `use utils::helper` should be classified as internal, not external
+	deps := findFactByKind(allFacts, facts.KindDependency)
+	for _, d := range deps {
+		if d.File != "src/lib.rs" {
+			continue
+		}
+		for _, r := range d.Relations {
+			if r.Kind == facts.RelImports && r.Target == "utils" {
+				source, _ := d.Props["source"].(string)
+				if source != "internal" {
+					t.Errorf("use utils::helper should be internal, got source=%q", source)
+				}
+				return // found and checked
+			}
+		}
+	}
+	// If we get here, the import wasn't found at all as "utils"
+	t.Log("Dependencies from src/lib.rs:")
+	for _, d := range deps {
+		if d.File == "src/lib.rs" {
+			for _, r := range d.Relations {
+				t.Logf("  %s → %s (source=%v)", r.Kind, r.Target, d.Props["source"])
+			}
+		}
+	}
+	t.Error("expected to find import targeting 'utils' from src/lib.rs")
+}
+
+// --- Acceptance test: crate:: imports resolve to module dirs ---
+
+func TestAcceptance_CrateImportsResolveToModuleDirs(t *testing.T) {
+	dir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(dir, "src", "models"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Cargo.toml"), []byte("[package]\nname = \"testcrate\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mainRs := `use crate::models::User;
+
+pub fn run() {}
+`
+	if err := os.WriteFile(filepath.Join(dir, "src", "main.rs"), []byte(mainRs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	modelsRs := `pub struct User {}
+`
+	if err := os.WriteFile(filepath.Join(dir, "src", "models", "mod.rs"), []byte(modelsRs), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ext := New()
+	allFacts, err := ext.Extract(context.Background(), dir, []string{
+		"src/main.rs",
+		"src/models/mod.rs",
+	})
+	if err != nil {
+		t.Fatalf("Extract error: %v", err)
+	}
+
+	// `use crate::models::User` should produce an import targeting "src/models"
+	// (the module directory), not "crate::models::User" (raw Rust path)
+	deps := findFactByKind(allFacts, facts.KindDependency)
+	foundModuleImport := false
+	for _, d := range deps {
+		if d.File != "src/main.rs" {
+			continue
+		}
+		for _, r := range d.Relations {
+			if r.Kind == facts.RelImports && r.Target == "src/models" {
+				foundModuleImport = true
+			}
+		}
+	}
+	if !foundModuleImport {
+		t.Error("use crate::models::User should resolve import target to src/models")
+		t.Log("Dependencies from src/main.rs:")
+		for _, d := range deps {
+			if d.File == "src/main.rs" {
+				for _, r := range d.Relations {
+					t.Logf("  %s → %s (source=%v)", r.Kind, r.Target, d.Props["source"])
+				}
+			}
+		}
 	}
 }
 

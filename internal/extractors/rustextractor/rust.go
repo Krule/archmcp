@@ -6,7 +6,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"unsafe"
 
@@ -47,6 +46,9 @@ func (e *RustExtractor) Extract(ctx context.Context, repoPath string, files []st
 
 	modules := make(map[string]bool)
 
+	// Build workspace crate map for cross-crate resolution
+	crateMap := buildCrateMap(repoPath)
+
 	for _, relFile := range files {
 		select {
 		case <-ctx.Done():
@@ -66,11 +68,29 @@ func (e *RustExtractor) Extract(ctx context.Context, repoPath string, files []st
 		}
 
 		fileFacts := extractFileAST(src, relFile)
+
+		// Resolve cross-crate import targets using workspace crate map
+		if len(crateMap) > 0 {
+			fileFacts = resolveCrateImports(fileFacts, crateMap)
+		}
+
 		allFacts = append(allFacts, fileFacts...)
 
 		dir := filepath.Dir(relFile)
 		modules[dir] = true
 	}
+
+	// Cross-file call target resolution: resolve calls that the per-file pass
+	// couldn't resolve because the target is defined in a different file within
+	// the same module directory. This is critical for cohesion analysis.
+	allFacts = resolveCallTargetsCrossFile(allFacts)
+
+	// Resolve mod-relative use statements: `use sibling_mod::X` where
+	// sibling_mod is declared via `mod sibling_mod;` in the same file.
+	allFacts = resolveModRelativeImports(allFacts)
+
+	// Resolve crate:: imports to module directory paths.
+	allFacts = resolveCratePathImports(allFacts, modules)
 
 	for dir := range modules {
 		allFacts = append(allFacts, facts.Fact{
@@ -195,6 +215,9 @@ func extractFileAST(src []byte, relFile string) []facts.Fact {
 
 	// Merge impl-trait-for relations onto existing struct/enum facts
 	result = mergeImplRelations(result)
+
+	// Resolve call targets from raw AST form to fact-name form
+	result = resolveCallTargets(result)
 
 	return result
 }
@@ -353,15 +376,21 @@ func extractUseDecl(node *sitter.Node, src []byte, relFile, dir string) []facts.
 		target = parts[0]
 	}
 
+	props := map[string]any{
+		"language": "rust",
+		"source":   source,
+	}
+	// Store the full import path so cross-crate resolution can resolve sub-modules
+	if source == "external" && strings.Contains(importPath, "::") {
+		props["import_path"] = importPath
+	}
+
 	return []facts.Fact{{
-		Kind: facts.KindDependency,
-		Name: dir + " -> " + target,
-		File: relFile,
-		Line: int(node.StartPosition().Row) + 1,
-		Props: map[string]any{
-			"language": "rust",
-			"source":   source,
-		},
+		Kind:  facts.KindDependency,
+		Name:  dir + " -> " + target,
+		File:  relFile,
+		Line:  int(node.StartPosition().Row) + 1,
+		Props: props,
 		Relations: []facts.Relation{
 			{Kind: facts.RelImports, Target: target},
 		},
@@ -523,6 +552,40 @@ func extractTraitItem(node *sitter.Node, src []byte, relFile, dir string) facts.
 	}
 }
 
+// extractImplTypeNames extracts type names from an impl_item node.
+// Handles both bare types (impl Foo) and generic types (impl<'a> Foo<'a>).
+// Returns names in order of appearance (for "impl Trait for Type": [Trait, Type]).
+func extractImplTypeNames(node *sitter.Node, src []byte) []string {
+	var names []string
+	seenKeywords := map[string]bool{"impl": true, "for": true}
+
+	for i := range node.ChildCount() {
+		child := node.Child(i)
+		kind := child.Kind()
+
+		if kind == "type_identifier" {
+			text := treesitter.NodeText(child, src)
+			if !seenKeywords[text] {
+				names = append(names, text)
+			}
+		} else if kind == "generic_type" {
+			// generic_type contains: type_identifier, type_arguments
+			inner := treesitter.FindChildByKind(child, "type_identifier")
+			if inner != nil {
+				names = append(names, treesitter.NodeText(inner, src))
+			}
+		} else if kind == "scoped_type_identifier" {
+			// e.g. path::Type — extract just the last type_identifier
+			inner := treesitter.FindChildByKind(child, "type_identifier")
+			if inner != nil {
+				names = append(names, treesitter.NodeText(inner, src))
+			}
+		}
+	}
+
+	return names
+}
+
 // --- impl_item ---
 
 func extractImplItem(node *sitter.Node, src []byte, relFile, dir string) []facts.Fact {
@@ -532,19 +595,22 @@ func extractImplItem(node *sitter.Node, src []byte, relFile, dir string) []facts
 	// In the AST: impl_item has type_identifier children.
 	// For "impl Trait for Type": impl, type_identifier(Trait), for, type_identifier(Type), declaration_list
 	// For "impl Type": impl, type_identifier(Type), declaration_list
-	typeIdents := treesitter.FindChildrenByKind(node, "type_identifier")
+	//
+	// When generics are present (impl<'a> Foo<'a>), the type is wrapped in
+	// a generic_type node: generic_type { type_identifier("Foo"), type_arguments }
+	// We need to extract the type_identifier from generic_type nodes too.
+	typeNames := extractImplTypeNames(node, src)
 
 	var typeName, traitName string
 	hasFork := treesitter.FindChildByKind(node, "for") != nil
 
-	if hasFork && len(typeIdents) >= 2 {
+	if hasFork && len(typeNames) >= 2 {
 		// impl Trait for Type
-		traitName = treesitter.NodeText(typeIdents[0], src)
-		typeName = treesitter.NodeText(typeIdents[1], src)
-	} else if len(typeIdents) >= 1 {
+		traitName = typeNames[0]
+		typeName = typeNames[1]
+	} else if len(typeNames) >= 1 {
 		// impl Type (possibly with generics)
-		// The type_identifier could be the first or only one
-		typeName = treesitter.NodeText(typeIdents[0], src)
+		typeName = typeNames[0]
 	}
 
 	// If it's "impl Trait for Type", emit impl relation
@@ -749,154 +815,6 @@ func extractModItem(node *sitter.Node, src []byte, relFile, dir string) facts.Fa
 	}
 }
 
-// --- Call extraction from AST ---
-
-// Keywords that look like function calls but aren't.
-var callKeywords = map[string]bool{
-	"if": true, "while": true, "for": true, "match": true,
-	"return": true, "let": true, "else": true, "unsafe": true,
-	"async": true, "await": true, "move": true, "loop": true,
-	"fn": true, "pub": true, "use": true, "mod": true,
-	"struct": true, "enum": true, "trait": true, "impl": true,
-	"type": true, "const": true, "static": true, "where": true,
-	"as": true, "in": true, "ref": true, "mut": true,
-	"Some": true, "None": true, "Ok": true, "Err": true,
-	"Box": true, "Vec": true, "Arc": true, "Rc": true,
-}
-
-// extractCallsFromNode walks a block node and extracts call_expression targets.
-// Returns deduplicated call targets in dotted form matching the regex-based extractCalls output.
-func extractCallsFromNode(block *sitter.Node, src []byte) []string {
-	seen := make(map[string]bool)
-	var calls []string
-
-	walkDescendants(block, func(node *sitter.Node) {
-		if node.Kind() != "call_expression" {
-			return
-		}
-
-		target := extractCallTarget(node, src)
-		if target == "" {
-			return
-		}
-
-		if !seen[target] {
-			seen[target] = true
-			calls = append(calls, target)
-		}
-	})
-
-	return calls
-}
-
-// extractCallTarget extracts the call target string from a call_expression node.
-// Returns "" if the target should be skipped (keyword, etc.)
-func extractCallTarget(node *sitter.Node, src []byte) string {
-	if node.ChildCount() == 0 {
-		return ""
-	}
-
-	fn := node.Child(0) // The function being called
-	switch fn.Kind() {
-	case "identifier":
-		// Simple function call: callee()
-		name := treesitter.NodeText(fn, src)
-		if callKeywords[name] {
-			return ""
-		}
-		return name
-
-	case "field_expression":
-		// Method call: obj.method() or self.method()
-		// field_expression has: <expr> . <field_identifier>
-		obj := fn.Child(0)
-		field := treesitter.FindChildByKind(fn, "field_identifier")
-		if obj == nil || field == nil {
-			return ""
-		}
-		objName := ""
-		switch obj.Kind() {
-		case "identifier":
-			objName = treesitter.NodeText(obj, src)
-		case "self":
-			objName = "self"
-		default:
-			// Complex expression like foo.bar.baz() — use the source text of the receiver
-			objName = treesitter.NodeText(obj, src)
-		}
-		fieldName := treesitter.NodeText(field, src)
-		if callKeywords[objName] || callKeywords[fieldName] {
-			return ""
-		}
-		return objName + "." + fieldName
-
-	case "scoped_identifier":
-		// Qualified call: Type::method() or module::function()
-		// scoped_identifier has: <identifier|scoped_identifier> :: <identifier>
-		parts := flattenScopedIdent(fn, src)
-		if len(parts) == 0 {
-			return ""
-		}
-		// Use dotted form to match regex behavior: "Config::load" -> "Config.load"
-		target := strings.Join(parts, ".")
-		// Check if last part is a keyword
-		last := parts[len(parts)-1]
-		if callKeywords[last] {
-			return ""
-		}
-		return target
-	}
-
-	return ""
-}
-
-// flattenScopedIdent flattens a scoped_identifier tree into string parts.
-// e.g. std::io::stdout -> ["std", "io", "stdout"]
-// But for call targets we only want the last two segments to match regex behavior.
-func flattenScopedIdent(node *sitter.Node, src []byte) []string {
-	if node == nil {
-		return nil
-	}
-	switch node.Kind() {
-	case "identifier":
-		return []string{treesitter.NodeText(node, src)}
-	case "crate":
-		return []string{"crate"}
-	case "self":
-		return []string{"self"}
-	case "super":
-		return []string{"super"}
-	case "scoped_identifier":
-		var parts []string
-		for i := range node.ChildCount() {
-			child := node.Child(i)
-			if child.Kind() == "::" {
-				continue
-			}
-			parts = append(parts, flattenScopedIdent(child, src)...)
-		}
-		// For call targets, regex only captures the last two segments.
-		// e.g. "std::io::stdout()" regex matches as "io.stdout"
-		// But "Config::load()" matches as "Config.load"
-		// The regex pattern is: (?:(\w+)(?:::|\.))?([\w]+)(!?)\s*\(
-		// This means it only captures ONE qualifier and one name.
-		if len(parts) > 2 {
-			parts = parts[len(parts)-2:]
-		}
-		return parts
-	}
-	return []string{treesitter.NodeText(node, src)}
-}
-
-// walkDescendants visits all descendants of a node, calling fn for each.
-func walkDescendants(node *sitter.Node, fn func(*sitter.Node)) {
-	for i := range node.ChildCount() {
-		child := node.Child(i)
-		fn(child)
-		walkDescendants(child, fn)
-	}
-}
-
 // --- extractFile wrapper for backward compatibility with tests ---
 // The tests call extractFile(f *os.File, relFile string), so we keep this wrapper.
 
@@ -907,270 +825,4 @@ func extractFile(f *os.File, relFile string) []facts.Fact {
 		return nil
 	}
 	return extractFileAST(src, relFile)
-}
-
-// --- Regex-based call extraction (preserved for direct unit test calls) ---
-
-var (
-	// Function/method call: optional qualifier (Type::, self., obj.) + name + "("
-	// group 1: qualifier, group 2: function name, group 3: "!" if macro
-	callRe = regexp.MustCompile(`(?:(\w+)(?:::|\.))?([\w]+)(!?)\s*\(`)
-)
-
-// extractCalls extracts function/method call targets from a single line of Rust code.
-// Returns slice of call targets in dotted form: "func", "qualifier.func".
-func extractCalls(line string) []string {
-	matches := callRe.FindAllStringSubmatch(line, -1)
-	var calls []string
-	seen := make(map[string]bool)
-
-	for _, m := range matches {
-		qualifier := m[1]
-		name := m[2]
-		bang := m[3]
-
-		// Skip macro invocations (ending with !)
-		if bang == "!" {
-			continue
-		}
-
-		// Skip keywords
-		if callKeywords[name] {
-			continue
-		}
-		// Skip if the qualifier is a keyword
-		if qualifier != "" && callKeywords[qualifier] {
-			continue
-		}
-
-		var target string
-		if qualifier != "" {
-			target = qualifier + "." + name
-		} else {
-			target = name
-		}
-
-		if !seen[target] {
-			seen[target] = true
-			calls = append(calls, target)
-		}
-	}
-
-	return calls
-}
-
-// --- impl relation merging ---
-
-// implRelation is a temporary holder for "impl Trait for Type" relations.
-// It generates a synthetic fact that gets merged onto the real type fact.
-type implRelation struct {
-	typeName  string
-	traitName string
-	dir       string
-}
-
-func (ir implRelation) asFact(relFile string, line int) facts.Fact {
-	return facts.Fact{
-		Kind: "impl_relation", // synthetic, will be merged
-		Name: ir.dir + "." + ir.typeName + "+impl+" + ir.traitName,
-		File: relFile,
-		Line: line,
-		Props: map[string]any{
-			"type_name":  ir.typeName,
-			"trait_name": ir.traitName,
-			"dir":        ir.dir,
-		},
-	}
-}
-
-// mergeImplRelations takes the fact list, finds synthetic impl_relation facts,
-// and adds implements relations to the corresponding type facts.
-func mergeImplRelations(ff []facts.Fact) []facts.Fact {
-	// Collect impl relations
-	type implInfo struct {
-		traitName string
-		dir       string
-	}
-	implMap := make(map[string][]implInfo) // typeName -> []implInfo
-
-	var cleaned []facts.Fact
-	for _, f := range ff {
-		if f.Kind == "impl_relation" {
-			typeName := f.Props["type_name"].(string)
-			traitName := f.Props["trait_name"].(string)
-			dir := f.Props["dir"].(string)
-			implMap[typeName] = append(implMap[typeName], implInfo{traitName, dir})
-		} else {
-			cleaned = append(cleaned, f)
-		}
-	}
-
-	// Apply impl relations to existing facts
-	for i := range cleaned {
-		f := &cleaned[i]
-		if f.Kind != facts.KindSymbol {
-			continue
-		}
-		// Extract the simple name from "dir.Name"
-		parts := strings.SplitN(f.Name, ".", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		simpleName := parts[1]
-		dir := parts[0]
-
-		if impls, ok := implMap[simpleName]; ok {
-			for _, impl := range impls {
-				if impl.dir == dir {
-					f.Relations = append(f.Relations, facts.Relation{
-						Kind:   facts.RelImplements,
-						Target: impl.traitName,
-					})
-				}
-			}
-		}
-	}
-
-	return cleaned
-}
-
-func isRustFile(path string) bool {
-	return strings.HasSuffix(strings.ToLower(path), ".rs")
-}
-
-// --- Cargo.toml dependency parsing ---
-
-var (
-	// Matches TOML section headers like [dependencies], [dev-dependencies], [build-dependencies]
-	tomlSectionRe = regexp.MustCompile(`^\s*\[([^\]]+)\]\s*$`)
-
-	// Matches simple deps: name = "version"
-	simpleDepRe = regexp.MustCompile(`^\s*([a-zA-Z_][\w-]*)\s*=\s*"([^"]*)"`)
-
-	// Matches inline table deps: name = { ... }
-	inlineTableDepRe = regexp.MustCompile(`^\s*([a-zA-Z_][\w-]*)\s*=\s*\{([^}]*)\}`)
-
-	// For parsing inline table fields
-	inlineVersionRe   = regexp.MustCompile(`version\s*=\s*"([^"]*)"`)
-	inlinePathRe      = regexp.MustCompile(`path\s*=\s*"([^"]*)"`)
-	inlineWorkspaceRe = regexp.MustCompile(`workspace\s*=\s*true`)
-)
-
-// cargoDepInfo holds parsed info about a single Cargo.toml dependency.
-type cargoDepInfo struct {
-	Name  string
-	Props map[string]any
-}
-
-// parseCargoToml parses [dependencies], [dev-dependencies], and [build-dependencies]
-// from a Cargo.toml file and returns dependency facts.
-func parseCargoToml(data []byte) []facts.Fact {
-	var result []facts.Fact
-
-	lines := strings.Split(string(data), "\n")
-	var currentScope string // "", "normal", "dev", "build"
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Skip empty lines and comments
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-
-		// Check for section header
-		if m := tomlSectionRe.FindStringSubmatch(trimmed); m != nil {
-			section := strings.TrimSpace(m[1])
-			switch section {
-			case "dependencies":
-				currentScope = "normal"
-			case "dev-dependencies":
-				currentScope = "dev"
-			case "build-dependencies":
-				currentScope = "build"
-			default:
-				currentScope = ""
-			}
-			continue
-		}
-
-		// Only parse lines inside a dependency section
-		if currentScope == "" {
-			continue
-		}
-
-		// Try inline table first: name = { version = "1.0", ... }
-		if m := inlineTableDepRe.FindStringSubmatch(trimmed); m != nil {
-			crateName := m[1]
-			tableContent := m[2]
-			dep := parseInlineTableDep(crateName, tableContent, currentScope)
-			result = append(result, dep)
-			continue
-		}
-
-		// Try simple string: name = "version"
-		if m := simpleDepRe.FindStringSubmatch(trimmed); m != nil {
-			crateName := m[1]
-			version := m[2]
-			result = append(result, makeDepFact(crateName, version, "external", currentScope, nil))
-			continue
-		}
-	}
-
-	return result
-}
-
-// parseInlineTableDep parses the content of an inline table like: version = "1", features = ["full"]
-func parseInlineTableDep(name, tableContent, scope string) facts.Fact {
-	props := map[string]any{}
-
-	if m := inlineVersionRe.FindStringSubmatch(tableContent); m != nil {
-		props["version"] = m[1]
-	}
-	if m := inlinePathRe.FindStringSubmatch(tableContent); m != nil {
-		props["path"] = m[1]
-	}
-	if inlineWorkspaceRe.MatchString(tableContent) {
-		props["workspace"] = true
-	}
-
-	// Determine source
-	source := "external"
-	if _, hasPath := props["path"]; hasPath {
-		source = "internal"
-	}
-
-	return makeDepFact(name, props["version"], source, scope, props)
-}
-
-// makeDepFact creates a facts.Fact for a Cargo.toml dependency.
-func makeDepFact(name string, version any, source, scope string, extraProps map[string]any) facts.Fact {
-	props := map[string]any{
-		"language":  "rust",
-		"source":    source,
-		"dep_scope": scope,
-	}
-
-	// Set version if available
-	if v, ok := version.(string); ok && v != "" {
-		props["version"] = v
-	}
-
-	// Merge extra props
-	for k, v := range extraProps {
-		if k == "version" {
-			continue // already handled
-		}
-		props[k] = v
-	}
-
-	return facts.Fact{
-		Kind:  facts.KindDependency,
-		Name:  name,
-		File:  "Cargo.toml",
-		Props: props,
-		Relations: []facts.Relation{
-			{Kind: facts.RelDependsOn, Target: name},
-		},
-	}
 }
