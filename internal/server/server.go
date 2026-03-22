@@ -949,7 +949,7 @@ func (s *Server) exploreFile(store *facts.Store, focus string, depth int, sb *st
 
 	// Try appending common extensions (with and without repo labels).
 	if len(fileFacts) == 0 {
-		extensions := []string{".go", ".ts", ".tsx", ".kt", ".swift", ".rb", ".rs", ".py"}
+		extensions := []string{".go", ".ts", ".tsx", ".kt", ".swift", ".rb", ".py"}
 		candidates := make([]string, 0, len(extensions)*(1+len(s.repoLabels())))
 		for _, ext := range extensions {
 			candidates = append(candidates, focus+ext)

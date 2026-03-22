@@ -222,6 +222,7 @@ func mapTestsToModules(modules []facts.Fact, testFiles map[string]bool) map[stri
 
 	for testFile := range testFiles {
 		dir := fileDir(testFile)
+
 		// Find the best matching module (longest prefix match).
 		bestMatch := ""
 		for _, m := range modules {

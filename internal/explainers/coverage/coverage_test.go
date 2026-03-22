@@ -338,7 +338,7 @@ func TestExplain_TraitKindVariants(t *testing.T) {
 	// Ensure both "interface" and "trait" symbol_kinds are detected
 	store := makeStore(
 		iface("GoInterface", "pkg/go.go"),
-		trait("RustTrait", "pkg/rust.rs"),
+		trait("SomeTrait", "pkg/traits.go"),
 		// Neither implemented
 	)
 
@@ -359,7 +359,7 @@ func TestExplain_TraitKindVariants(t *testing.T) {
 	if !orphanSymbols["GoInterface"] {
 		t.Error("GoInterface should be flagged as orphan")
 	}
-	if !orphanSymbols["RustTrait"] {
-		t.Error("RustTrait should be flagged as orphan")
+	if !orphanSymbols["SomeTrait"] {
+		t.Error("SomeTrait should be flagged as orphan")
 	}
 }

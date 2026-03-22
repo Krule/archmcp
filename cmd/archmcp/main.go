@@ -26,7 +26,6 @@ import (
 	"github.com/dejo1307/archmcp/internal/extractors/openapiextractor"
 	"github.com/dejo1307/archmcp/internal/extractors/pythonextractor"
 	"github.com/dejo1307/archmcp/internal/extractors/rubyextractor"
-	"github.com/dejo1307/archmcp/internal/extractors/rustextractor"
 	"github.com/dejo1307/archmcp/internal/extractors/swiftextractor"
 	"github.com/dejo1307/archmcp/internal/extractors/tsextractor"
 	"github.com/dejo1307/archmcp/internal/facts"
@@ -106,7 +105,6 @@ func run(args []string, stdout, stderr io.Writer) int {
 	eng.RegisterExtractor(tsextractor.New())
 	eng.RegisterExtractor(swiftextractor.New())
 	eng.RegisterExtractor(rubyextractor.New())
-	eng.RegisterExtractor(rustextractor.New())
 
 	// Register explainers
 	eng.RegisterExplainer(apisurface.New())

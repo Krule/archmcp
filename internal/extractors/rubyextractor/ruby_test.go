@@ -9,7 +9,7 @@ import (
 	"github.com/dejo1307/archmcp/internal/facts"
 )
 
-// --- Test helpers (following rustextractor/rust_test.go pattern) ---
+// --- Test helpers ---
 
 // extractFromRubyString writes Ruby source to a temp file and runs extractFileAST.
 func extractFromRubyString(t *testing.T, src string, relFile string, isRails bool, exported bool) []facts.Fact {

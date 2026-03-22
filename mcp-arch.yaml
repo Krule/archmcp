@@ -52,9 +52,6 @@ ignore:
   # Swift tests
   - "**/*Tests.swift"
   - "**/*Test.swift"
-  # Rust / Cargo
-  - "target/**"
-  - "**/target/**"
   # Ruby / Rails
   - "**/*_spec.rb"
   - "**/*_test.rb"
@@ -67,7 +64,6 @@ extractors:
   - kotlin
   - openapi
   - python
-  - rust
   - typescript
   - swift
   - ruby

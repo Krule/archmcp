@@ -40,7 +40,7 @@ func Default() *Config {
 			"**/*_test.rb",
 			".archmcp/**",
 		},
-		Extractors: []string{"go", "kotlin", "openapi", "python", "rust", "typescript", "swift", "ruby"},
+		Extractors: []string{"go", "kotlin", "openapi", "python", "typescript", "swift", "ruby"},
 		Explainers: []string{"apisurface", "cohesion", "coupling", "coverage", "cycles", "deadcode", "depdepth", "godmodule", "layers", "stability", "testmap"},
 		Renderers:  []string{"llm_context"},
 		Output: OutputConfig{

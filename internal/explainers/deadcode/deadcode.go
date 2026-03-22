@@ -90,8 +90,12 @@ func buildReferencedSet(symbols []facts.Fact) map[string]bool {
 func isExcluded(sym facts.Fact) bool {
 	name := sym.Name
 
-	// Exclude main and init entrypoints
-	if name == "main" || name == "init" {
+	// Exclude main and init entrypoints (bare "main" or qualified "src.main")
+	simpleName := name
+	if idx := strings.LastIndex(name, "."); idx >= 0 {
+		simpleName = name[idx+1:]
+	}
+	if simpleName == "main" || simpleName == "init" {
 		return true
 	}
 
@@ -100,8 +104,8 @@ func isExcluded(sym facts.Fact) bool {
 		return true
 	}
 
-	// Exclude test functions (Test*, Benchmark*, Example*)
-	if isTestFunction(name) {
+	// Exclude test functions (Go: Test*, Benchmark*, Example*)
+	if isTestFunction(simpleName) {
 		return true
 	}
 

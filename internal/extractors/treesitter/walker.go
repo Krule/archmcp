@@ -1,6 +1,6 @@
 // Package treesitter provides shared helpers for walking tree-sitter ASTs.
 // It reduces duplication across language-specific extractors that use tree-sitter
-// for parsing (e.g., TypeScript, future Rust tree-sitter migration).
+// for parsing (e.g., TypeScript).
 package treesitter
 
 import (
